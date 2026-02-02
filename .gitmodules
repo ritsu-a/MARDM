@@ -1,0 +1,3 @@
+[submodule "external/GMR"]
+	path = external/GMR
+	url = git@github.com:ritsu-a/GMR.git
