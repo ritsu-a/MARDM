@@ -27,9 +27,10 @@ def main(args):
     #################################################################################
     dim_pose = 64 if args.dataset_name == 'kit' else 67
     nb_joints = 21 if args.dataset_name == 'kit' else 22
-    data_root = f'{args.dataset_dir}/KIT-ML/' if args.dataset_name == 'kit' else f'{args.dataset_dir}/HumanML3D/'
-    mean = np.load(pjoin(data_root, 'Mean.npy'))
-    std = np.load(pjoin(data_root, 'Std.npy'))
+    # data_root = f'{args.dataset_dir}/KIT-ML/' if args.dataset_name == 'kit' else f'{args.dataset_dir}/HumanML3D/'
+    data_root = '/root/workspace/MARDM/utils/eval_mean_std/t2m'
+    mean = np.load(pjoin(data_root, 'eval_mean.npy'))
+    std = np.load(pjoin(data_root, 'eval_std.npy'))
     #################################################################################
     #                                      Models                                   #
     #################################################################################

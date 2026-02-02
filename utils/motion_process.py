@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import mpl_toolkits.mplot3d.axes3d as p3
+import imageio
 
 #################################################################################
 #                                   Data Params                                 #
@@ -171,7 +172,30 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, figsize=(10, 10), f
         ax.set_yticklabels([])
         ax.set_zticklabels([])
 
-    ani = FuncAnimation(fig, update, frames=frame_number, interval=1000 / fps, repeat=False)
-
-    ani.save(save_path, fps=fps)
+    # 使用 imageio 保存视频，避免 matplotlib 编码器问题
+    frames = []
+    for index in range(frame_number):
+        update(index)
+        # 将当前帧转换为图像数组
+        fig.canvas.draw()
+        # 获取 RGB 缓冲区
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        width, height = fig.canvas.get_width_height()
+        frame = buf.reshape(height, width, 3)
+        frames.append(frame)
+    
+    # 使用 imageio 保存视频，使用 ffmpeg 作为后端
+    try:
+        # 尝试使用 libx264 编码器
+        imageio.mimsave(save_path, frames, fps=fps, codec='libx264')
+    except Exception:
+        # 如果失败，尝试使用默认编码器
+        try:
+            imageio.mimsave(save_path, frames, fps=fps)
+        except Exception:
+            # 如果还是失败，使用 ffmpeg 插件
+            writer = imageio.get_writer(save_path, fps=fps, codec='libx264')
+            for frame in frames:
+                writer.append_data(frame)
+            writer.close()
     plt.close()

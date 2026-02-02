@@ -1,0 +1,6 @@
+Visualization of vanilla MARDM:
+    python sample.py --name MARDM_SiT_XL --text_prompt "A person is waving his left hand."
+
+
+
+
