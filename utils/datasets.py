@@ -162,6 +162,210 @@ class BEAT_v2Dataset(data.Dataset):
         return motion
 
 
+class BEAT_v2Audio2MotionDataset(data.Dataset):
+    def __init__(self, mean, std, data_root, unit_length, max_motion_length, split='train', train_ratio=0.9):
+        """
+        BEAT_v2 Dataset for Audio-to-Motion training (MARDM)
+        Args:
+            mean: mean for normalization
+            std: std for normalization
+            data_root: root directory of BEAT_v2 data (e.g., '/root/workspace/MARDM/data/BEAT_v2')
+            unit_length: unit length for motion (default 4)
+            max_motion_length: maximum motion length (should be 180)
+            split: 'train' or 'val'
+            train_ratio: ratio of training data
+        """
+        self.mean = mean
+        self.std = std
+        self.unit_length = unit_length
+        self.max_motion_length = max_motion_length  # Should be 180
+        
+        # Frame alignment: 50 audio frames = 60 motion frames
+        # Ratio: audio_frames / motion_frames = 50/60 = 5/6
+        # For 180 motion frames, we need 180 * 5/6 = 150 audio frames
+        self.target_motion_frames = 180
+        self.target_audio_frames = int(self.target_motion_frames * 5 / 6)  # 150
+        self.audio_to_motion_ratio = 5.0 / 6.0  # 50/60
+        
+        # Minimum length requirement: need at least target frames
+        min_motion_len = self.target_motion_frames
+        max_motion_len = 50000  # BEAT_v2 sequences can be very long
+        
+        # Find all npz files (motion data)
+        npz_files = []
+        for root, dirs, files in os.walk(data_root):
+            for file in files:
+                if file.endswith('.npz') and not file.endswith('_whisper_features.npy'):
+                    npz_files.append(os.path.join(root, file))
+        
+        npz_files.sort()  # Ensure consistent ordering
+        random.seed(42)  # Fixed seed for reproducibility
+        random.shuffle(npz_files)
+        
+        # Split train/val
+        split_idx = int(len(npz_files) * train_ratio)
+        if split == 'train':
+            npz_files = npz_files[:split_idx]
+        else:
+            npz_files = npz_files[split_idx:]
+        
+        print(f"Loading {split} data from {len(npz_files)} files...")
+        
+        self.data_dict = {}
+        self.name_list = []
+        self.length_list = []
+        
+        skipped_no_whisper = 0
+        skipped_length = 0
+        skipped_error = 0
+        
+        for npz_path in tqdm(npz_files):
+            try:
+                # Load motion data
+                motion_data = np.load(npz_path)
+                if 'qpos' in motion_data:
+                    motion = motion_data['qpos']
+                else:
+                    keys = list(motion_data.keys())
+                    if len(keys) > 0:
+                        motion = motion_data[keys[0]]
+                    else:
+                        skipped_error += 1
+                        continue
+                
+                if len(motion.shape) == 1:
+                    motion = motion.reshape(-1, 1)
+                
+                motion_len = motion.shape[0]
+                if motion_len < min_motion_len or motion_len >= max_motion_len:
+                    skipped_length += 1
+                    continue
+                
+                # Find corresponding whisper feature file
+                # npz file: /path/to/1_wayne_0_1_1.npz
+                # whisper file: /path/to/1_wayne_0_1_1_whisper_features.npy
+                npz_dir = os.path.dirname(npz_path)
+                npz_basename = os.path.basename(npz_path)
+                npz_stem = os.path.splitext(npz_basename)[0]
+                
+                # Try to find whisper feature file
+                whisper_path = os.path.join(npz_dir, f"{npz_stem}_whisper_features.npy")
+                
+                if not os.path.exists(whisper_path):
+                    skipped_no_whisper += 1
+                    if skipped_no_whisper <= 5:  # Only print first 5 warnings
+                        print(f"Warning: No whisper feature found for {npz_path}, expected: {whisper_path}")
+                    continue
+                
+                # Load whisper features
+                try:
+                    whisper_features = np.load(whisper_path)
+                    # whisper_features shape: [time_frames, feature_dim]
+                    if len(whisper_features.shape) != 2:
+                        skipped_error += 1
+                        if skipped_error <= 5:
+                            print(f"Warning: Invalid whisper feature shape {whisper_features.shape} for {whisper_path}")
+                        continue
+                except Exception as e:
+                    skipped_error += 1
+                    if skipped_error <= 5:
+                        print(f"Error loading whisper features from {whisper_path}: {e}")
+                    continue
+                
+                # Verify alignment: check if audio and motion lengths match the expected ratio
+                motion_len = motion.shape[0]
+                audio_len = whisper_features.shape[0]
+                expected_audio_len = int(motion_len * self.audio_to_motion_ratio)
+                
+                # Allow some tolerance (within 5% difference)
+                tolerance = 0.05
+                if abs(audio_len - expected_audio_len) / max(expected_audio_len, 1) > tolerance:
+                    skipped_error += 1
+                    if skipped_error <= 5:
+                        print(f"Warning: Audio-motion length mismatch for {npz_path}: "
+                              f"motion={motion_len}, audio={audio_len}, expected_audio={expected_audio_len:.0f}")
+                    continue
+                
+                # Check if we have enough frames
+                if motion_len < self.target_motion_frames or audio_len < self.target_audio_frames:
+                    skipped_length += 1
+                    continue
+                
+                # Generate multiple samples from long sequences by sliding window
+                # For sequences longer than target, we create multiple samples
+                num_samples = (motion_len - self.target_motion_frames) // (self.target_motion_frames // 2) + 1
+                num_samples = min(num_samples, 10)  # Limit to 10 samples per sequence to avoid too many duplicates
+                
+                for sample_idx in range(num_samples):
+                    # Calculate start position
+                    if num_samples == 1:
+                        start_motion = 0
+                    else:
+                        max_start = motion_len - self.target_motion_frames
+                        start_motion = int(sample_idx * max_start / (num_samples - 1))
+                    
+                    start_audio = int(start_motion * self.audio_to_motion_ratio)
+                    
+                    # Extract fixed-length segments
+                    end_motion = start_motion + self.target_motion_frames
+                    end_audio = start_audio + self.target_audio_frames
+                    
+                    if end_motion > motion_len or end_audio > audio_len:
+                        continue
+                    
+                    motion_segment = motion[start_motion:end_motion]
+                    audio_segment = whisper_features[start_audio:end_audio]
+                    
+                    # Normalize motion
+                    motion_segment = motion_segment[:, :self.mean.shape[0]]
+                    motion_segment = (motion_segment - self.mean) / self.std
+                    
+                    # Pad motion if necessary (shouldn't happen, but just in case)
+                    if motion_segment.shape[0] < self.target_motion_frames:
+                        padding = np.zeros((self.target_motion_frames - motion_segment.shape[0], motion_segment.shape[1]))
+                        motion_segment = np.concatenate([motion_segment, padding], axis=0)
+                    
+                    # Store data
+                    name = f"{npz_stem}_sample{sample_idx}"
+                    self.data_dict[name] = {
+                        'motion': motion_segment.astype(np.float32),
+                        'whisper': audio_segment.astype(np.float32),
+                        'length': self.target_motion_frames
+                    }
+                    self.name_list.append(name)
+                    self.length_list.append(self.target_motion_frames)
+                
+            except Exception as e:
+                skipped_error += 1
+                if skipped_error <= 5:
+                    print(f"Error loading {npz_path}: {e}")
+                continue
+        
+        self.length_arr = np.array(self.length_list)
+        print(f"Total number of samples: {len(self.data_dict)}")
+        print(f"Skipped: {skipped_no_whisper} (no whisper), {skipped_length} (length), {skipped_error} (error)")
+    
+    def __len__(self):
+        return len(self.data_dict)
+    
+    def __getitem__(self, item):
+        """
+        Returns:
+            whisper_features: [target_audio_frames, feature_dim] - fixed size audio features sequence
+            motion: [target_motion_frames, motion_dim] - fixed size motion (180 frames)
+            m_length: int - motion length (always 180)
+        """
+        name = self.name_list[item]
+        data = self.data_dict[name]
+        motion = data['motion'].copy()  # Already normalized and fixed size [180, dim]
+        whisper_features = data['whisper'].copy()  # Already fixed size [150, feature_dim]
+        m_length = data['length']  # Always 180
+        
+        # Return full sequence for cross-attention support
+        # Shape: whisper_features [150, feature_dim], motion [180, motion_dim]
+        return whisper_features, motion, m_length
+
+
 class Text2MotionDataset(data.Dataset):
     def __init__(self, mean, std, split_file, dataset_name, motion_dir, text_dir, unit_length, max_motion_length,
                  max_text_length, evaluation=False):

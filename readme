@@ -45,7 +45,13 @@ Test VAE and generate comparison videos:
 
 
 Train MARDM:
-    python train_MARDM.py --name MARDM_SiT_XL --model "MARDM-SiT-XL" --dataset_name kit --batch_size 16 --ae_name AE --milestones 20000
+   
+    # For audio-to-motion dataset (beat_v2):
+    # 8 GPUs training:
+        torchrun --nproc_per_node=8 --master_port=29502 train_MARDM.py --name MARDM_SiT_XL_beat_v2 --model "MARDM-SiT-XL" --dataset_name beat_v2 --batch_size 16 --ae_name AE --milestones 20000
+    
+    # Single GPU training:
+    python train_MARDM.py --name MARDM_SiT_XL_beat_v2 --model "MARDM-SiT-XL" --dataset_name beat_v2 --batch_size 16 --ae_name AE --milestones 20000
 
 
 

@@ -9,7 +9,7 @@ import torch.optim as optim
 from models.AE import AE_models
 from models.MARDM import MARDM_models
 from utils.evaluators import Evaluators
-from utils.datasets import Text2MotionDataset, collate_fn
+from utils.datasets import Text2MotionDataset, BEAT_v2Audio2MotionDataset, collate_fn
 import time
 import copy
 from collections import OrderedDict, defaultdict
@@ -33,40 +33,78 @@ def main(args):
     #################################################################################
     #                                    Train Data                                 #
     #################################################################################
-    if args.dataset_name == "t2m":
+    if args.dataset_name == "beat_v2":
+        # BEAT_v2 dataset (audio-to-motion)
+        data_root = '/root/workspace/MARDM/data/BEAT_v2'
+        mean = np.load(pjoin(data_root, 'Mean.npy'))
+        std = np.load(pjoin(data_root, 'Std.npy'))
+        dim_pose = mean.shape[0]
+        
+        train_dataset = BEAT_v2Audio2MotionDataset(mean, std, data_root, args.unit_length, 
+                                                     args.max_motion_length, split='train')
+        val_dataset = BEAT_v2Audio2MotionDataset(mean, std, data_root, args.unit_length, 
+                                                   args.max_motion_length, split='val')
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, 
+                                  num_workers=args.num_workers, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, 
+                                num_workers=args.num_workers, shuffle=True)
+    elif args.dataset_name == "t2m":
         data_root = f'{args.dataset_dir}/HumanML3D/'
         dim_pose = 67
+        motion_dir = pjoin(data_root, 'new_joint_vecs')
+        text_dir = pjoin(data_root, 'texts')
+        mean = np.load(pjoin(data_root, 'Mean.npy'))
+        std = np.load(pjoin(data_root, 'Std.npy'))
+        train_split_file = pjoin(data_root, 'train.txt')
+        val_split_file = pjoin(data_root, 'val.txt')
+
+        train_dataset = Text2MotionDataset(mean, std, train_split_file, args.dataset_name, motion_dir, text_dir,
+                                              args.unit_length, args.max_motion_length, 20, evaluation=False)
+        val_dataset = Text2MotionDataset(mean, std, val_split_file, args.dataset_name, motion_dir, text_dir,
+                                          args.unit_length, args.max_motion_length, 20, evaluation=False)
+
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
+                                  shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
+                                shuffle=True)
     else:
         data_root = f'{args.dataset_dir}/KIT-ML/'
         dim_pose = 64
-    motion_dir = pjoin(data_root, 'new_joint_vecs')
-    text_dir = pjoin(data_root, 'texts')
-    mean = np.load(pjoin(data_root, 'Mean.npy'))
-    std = np.load(pjoin(data_root, 'Std.npy'))
-    train_split_file = pjoin(data_root, 'train.txt')
-    val_split_file = pjoin(data_root, 'val.txt')
+        motion_dir = pjoin(data_root, 'new_joint_vecs')
+        text_dir = pjoin(data_root, 'texts')
+        mean = np.load(pjoin(data_root, 'Mean.npy'))
+        std = np.load(pjoin(data_root, 'Std.npy'))
+        train_split_file = pjoin(data_root, 'train.txt')
+        val_split_file = pjoin(data_root, 'val.txt')
 
-    train_dataset = Text2MotionDataset(mean, std, train_split_file, args.dataset_name, motion_dir, text_dir,
-                                          args.unit_length, args.max_motion_length, 20, evaluation=False)
-    val_dataset = Text2MotionDataset(mean, std, val_split_file, args.dataset_name, motion_dir, text_dir,
+        train_dataset = Text2MotionDataset(mean, std, train_split_file, args.dataset_name, motion_dir, text_dir,
+                                              args.unit_length, args.max_motion_length, 20, evaluation=False)
+        val_dataset = Text2MotionDataset(mean, std, val_split_file, args.dataset_name, motion_dir, text_dir,
                                           args.unit_length, args.max_motion_length, 20, evaluation=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
-                              shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
-                            shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
+                                  shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
+                                shuffle=True)
 
     #################################################################################
     #                                    Eval Data                                  #
     #################################################################################
     if args.need_evaluation:
-        eval_mean = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_mean.npy')
-        eval_std = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_std.npy')
-        split_file = pjoin(data_root, 'val.txt')
-        eval_dataset = Text2MotionDataset(eval_mean, eval_std, split_file, args.dataset_name, motion_dir, text_dir,
-                                          4, 196, 20, evaluation=True)
-        eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
-                                 collate_fn=collate_fn, shuffle=True)
+        if args.dataset_name == "beat_v2":
+            # For beat_v2, use validation dataset for evaluation
+            eval_dataset = BEAT_v2Audio2MotionDataset(mean, std, data_root, 4, 196, split='val')
+            eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
+                                     shuffle=True)
+        else:
+            eval_mean = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_mean.npy')
+            eval_std = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_std.npy')
+            split_file = pjoin(data_root, 'val.txt')
+            eval_dataset = Text2MotionDataset(eval_mean, eval_std, split_file, args.dataset_name, motion_dir, text_dir,
+                                              4, 196, 20, evaluation=True)
+            eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
+                                     collate_fn=collate_fn, shuffle=True)
     #################################################################################
     #                                      Models                                   #
     #################################################################################
@@ -75,11 +113,19 @@ def main(args):
 
     ae = AE_models[args.ae_model](input_width=dim_pose)
     ckpt = torch.load(pjoin(args.checkpoints_dir, args.dataset_name, args.ae_name, 'model',
-                            'latest.tar' if args.dataset_name == 't2m' else 'net_best_fid.tar'), map_location='cpu')
+                            'latest.tar'), map_location='cpu')
     model_key = 'ae'
     ae.load_state_dict(ckpt[model_key])
 
-    mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode='text')
+    # Set condition mode based on dataset
+    if args.dataset_name == "beat_v2":
+        cond_mode = 'audio'
+        # Whisper base model feature dimension is 512
+        audio_dim = 512
+        mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim)
+    else:
+        cond_mode = 'text'
+        mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode)
     ema_mardm = copy.deepcopy(mardm)
     ema_mardm.eval()
     for param in ema_mardm.parameters():
@@ -148,7 +194,17 @@ def main(args):
             latent = ae.encode(motion)
             m_lens = m_lens // 4
 
-            conds = conds.to(device).float() if torch.is_tensor(conds) else conds
+            # For beat_v2, conds is whisper features sequence [batch_size, audio_frames, feature_dim]
+            # For text datasets, conds is text strings
+            if args.dataset_name == "beat_v2":
+                if isinstance(conds, np.ndarray):
+                    conds = torch.from_numpy(conds).to(device).float()
+                else:
+                    conds = conds.to(device).float()
+                # Pass full sequence for cross-attention (model will handle it)
+                # Shape: [batch_size, audio_frames, feature_dim]
+            else:
+                conds = conds.to(device).float() if torch.is_tensor(conds) else conds
 
             loss = mardm.forward_loss(latent, conds, m_lens)
 
@@ -188,7 +244,17 @@ def main(args):
                 latent = ae.encode(motion)
                 m_lens = m_lens // 4
 
-                conds = conds.to(device).float() if torch.is_tensor(conds) else conds
+                # For beat_v2, conds is whisper features sequence [batch_size, audio_frames, feature_dim]
+                # For text datasets, conds is text strings
+                if args.dataset_name == "beat_v2":
+                    if isinstance(conds, np.ndarray):
+                        conds = torch.from_numpy(conds).to(device).float()
+                    else:
+                        conds = conds.to(device).float()
+                    # Pass full sequence for cross-attention (model will handle it)
+                    # Shape: [batch_size, audio_frames, feature_dim]
+                else:
+                    conds = conds.to(device).float() if torch.is_tensor(conds) else conds
 
                 loss = mardm.forward_loss(latent, conds, m_lens)
                 val_loss.append(loss.item())
