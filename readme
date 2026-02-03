@@ -5,6 +5,20 @@ Visualization of vanilla MARDM:
 Visualization of source motion:
     python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/BEAT_v2/1/1_wayne_0_1_1.npz
 
+Preprocess whisper feature of BEAT_v2:
+    python utils/batch_whisper_features.py
+
+TODO:
+train & test VAE
+
+remove reorder token 
+
+remove text prompt condition(for now)
+
+add audio cross attention  
+
+
+train base model
 
 
 
