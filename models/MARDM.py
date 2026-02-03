@@ -112,16 +112,9 @@ class MARDM(nn.Module):
         cond = self.cond_emb(cond)
         x = self.position_enc(x)
         x = x.permute(1, 0, 2)
-        if mask is not None: # hard pseudo reorder, in practice, after pe, for transformer encoder architecture should be near same without hard because of bidirectional attention.
-            sort_indices = torch.argsort(mask.to(torch.float), dim=1)
-            x = torch.gather(x, dim=1, index=sort_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
-            inverse_indices = torch.argsort(sort_indices, dim=1)
-            padding_mask = torch.gather(padding_mask, dim=1, index=sort_indices)
 
         for block in self.MARTransformer:
             x = block(x, cond, padding_mask)
-        if mask is not None:
-            x = torch.gather(x, dim=1, index=inverse_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
         return x
 
     def forward_loss(self, latents, y, m_lens):
@@ -169,17 +162,13 @@ class MARDM(nn.Module):
 
         return loss
 
-    def forward_with_CFG(self, latents, cond_vector, padding_mask, cfg=3, mask=None, force_mask=False, hard_pseudo_reorder=False):
-        if hard_pseudo_reorder:
-            reorder_mask = mask.clone()
-        else:
-            reorder_mask = None
+    def forward_with_CFG(self, latents, cond_vector, padding_mask, cfg=3, mask=None, force_mask=False):
         if force_mask:
-            return self.forward(latents, cond_vector, padding_mask, force_mask=True, mask=reorder_mask)
+            return self.forward(latents, cond_vector, padding_mask, force_mask=True, mask=None)
 
-        logits = self.forward(latents, cond_vector, padding_mask, mask=reorder_mask)
+        logits = self.forward(latents, cond_vector, padding_mask, mask=None)
         if cfg != 1:
-            aux_logits = self.forward(latents, cond_vector, padding_mask, force_mask=True, mask=reorder_mask)
+            aux_logits = self.forward(latents, cond_vector, padding_mask, force_mask=True, mask=None)
             mixed_logits = torch.cat([logits, aux_logits], dim=0)
         else:
             mixed_logits = logits
@@ -209,8 +198,7 @@ class MARDM(nn.Module):
                  timesteps: int,
                  cond_scale: int,
                  temperature=1,
-                 force_mask=False,
-                 hard_pseudo_reorder=False
+                 force_mask=False
                  ):
         device = next(self.parameters()).device
         l = max(m_lens)
@@ -241,7 +229,7 @@ class MARDM(nn.Module):
 
             latents = torch.where(is_mask.unsqueeze(-1), self.mask_latent.repeat(b, l, 1), latents)
             logits = self.forward_with_CFG(latents, cond_vector=cond_vector, padding_mask=padding_mask,
-                                                  cfg=cond_scale, mask=is_mask, force_mask=force_mask, hard_pseudo_reorder=hard_pseudo_reorder)
+                                                  cfg=cond_scale, mask=is_mask, force_mask=force_mask)
             latents = torch.where(is_mask.unsqueeze(-1), logits, latents)
 
             masked_rand_schedule = masked_rand_schedule.masked_fill(~is_mask, 1e5)
@@ -261,7 +249,6 @@ class MARDM(nn.Module):
              force_mask=False,
              edit_mask=None,
              padding_mask=None,
-             hard_pseudo_reorder=False,
              ):
 
         device = next(self.parameters()).device
@@ -308,7 +295,7 @@ class MARDM(nn.Module):
 
             latents = torch.where(is_mask.unsqueeze(-1), self.mask_latent.repeat(latents.shape[0], latents.shape[1], 1), latents)
             logits = self.forward_with_CFG(latents, cond_vector=cond_vector, padding_mask=padding_mask,
-                                                  cfg=cond_scale, mask=is_mask, force_mask=force_mask, hard_pseudo_reorder=hard_pseudo_reorder)
+                                                  cfg=cond_scale, mask=is_mask, force_mask=force_mask)
             latents = torch.where(is_mask.unsqueeze(-1), logits, latents)
 
             masked_rand_schedule = masked_rand_schedule.masked_fill(~is_mask, 1e5)

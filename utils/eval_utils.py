@@ -130,7 +130,7 @@ def evaluation_ae(out_dir, val_loader, net, writer, ep, eval_wrapper, num_joint,
 def evaluation_mardm(out_dir, val_loader, ema_mardm, ae, writer, ep, best_fid, best_div,
                         best_top1, best_top2, best_top3, best_matching, eval_wrapper, device, clip_score_old, time_steps=None,
                         cond_scale=None, temperature=1, cal_mm=False, train_mean=None, train_std=None, plot_func=None,
-                        draw=True, hard_pseudo_reorder=False):
+                        draw=True):
 
     ema_mardm.eval()
     ae.eval()
@@ -170,7 +170,7 @@ def evaluation_mardm(out_dir, val_loader, ema_mardm, ae, writer, ep, best_fid, b
             batch_clip_score_pred = 0
             for _ in tqdm(range(30)):
                 pred_latents = ema_mardm.generate(clip_text, m_length//4 , time_steps, cond_scale,
-                                                  temperature=temperature, hard_pseudo_reorder=hard_pseudo_reorder)
+                                                  temperature=temperature)
                 pred_motions = ae.decode(pred_latents)
                 pred_motions = val_loader.dataset.inv_transform(pred_motions.detach().cpu().numpy(), train_mean, train_std)
                 pred_motions = val_loader.dataset.transform(pred_motions)
@@ -190,7 +190,7 @@ def evaluation_mardm(out_dir, val_loader, ema_mardm, ae, writer, ep, best_fid, b
 
         else:
             pred_latents = ema_mardm.generate(clip_text, m_length//4 , time_steps, cond_scale,
-                                              temperature=temperature, hard_pseudo_reorder=hard_pseudo_reorder)
+                                              temperature=temperature)
 
             pred_motions = ae.decode(pred_latents)
             pred_motions = val_loader.dataset.inv_transform(pred_motions.detach().cpu().numpy(), train_mean, train_std)

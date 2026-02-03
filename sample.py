@@ -111,7 +111,7 @@ def main(args):
         print("-->Repeat %d" % r)
         with torch.no_grad():
             pred_latents = ema_mardm.generate(captions, token_lens, args.time_steps, args.cfg,
-                                              temperature=args.temperature, hard_pseudo_reorder=args.hard_pseudo_reorder)
+                                              temperature=args.temperature)
             pred_motions = ae.decode(pred_latents)
             pred_motions = pred_motions.detach().cpu().numpy()
             data = pred_motions * std + mean
@@ -146,6 +146,5 @@ if __name__ == "__main__":
     parser.add_argument('--text_path', type=str, default="")
     parser.add_argument("--motion_length", default=0, type=int)
     parser.add_argument("--repeat_times", default=1, type=int)
-    parser.add_argument('--hard_pseudo_reorder', action="store_true")
     arg = parser.parse_args()
     main(arg)

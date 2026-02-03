@@ -42,6 +42,13 @@ Test VAE and generate comparison videos:
     
     Note: Use --sample_strategy diverse (default) to ensure different motions are selected.
           Options: sequential (order), diverse (spaced), random (completely random)
+
+
+Train MARDM:
+    python train_MARDM.py --name MARDM_SiT_XL --model "MARDM-SiT-XL" --dataset_name kit --batch_size 16 --ae_name AE --milestones 20000
+
+
+
 TODO:
 train & test VAE
 

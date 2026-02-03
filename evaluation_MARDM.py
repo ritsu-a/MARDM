@@ -96,7 +96,7 @@ def main(args):
                 best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
                 best_matching=best_matching, eval_wrapper=eval_wrapper, device=device, train_mean=mean, train_std=std,
                 time_steps=args.time_steps, cond_scale=args.cfg, temperature=args.temperature, cal_mm=args.cal_mm,
-                draw=False, hard_pseudo_reorder=args.hard_pseudo_reorder)
+                draw=False)
         fid.append(best_fid)
         div.append(best_div)
         top1.append(best_top1)
@@ -146,7 +146,6 @@ if __name__ == "__main__":
     parser.add_argument("--cfg", default=4.5, type=float)
     parser.add_argument("--temperature", default=1, type=float)
     parser.add_argument('--cal_mm', action="store_false")
-    parser.add_argument('--hard_pseudo_reorder', action="store_true")
 
     arg = parser.parse_args()
     main(arg)
