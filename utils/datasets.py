@@ -5,6 +5,8 @@ from tqdm import tqdm
 from torch.utils.data._utils.collate import default_collate
 import random
 import codecs as cs
+import os
+import glob
 from utils.glove import GloVe
 
 #################################################################################
@@ -57,6 +59,106 @@ class AEDataset(data.Dataset):
         motion = motion[:, :self.mean.shape[0]]
         motion = (motion - self.mean) / self.std
 
+        return motion
+
+
+class BEAT_v2Dataset(data.Dataset):
+    def __init__(self, mean, std, data_root, window_size, split='train', train_ratio=0.9):
+        """
+        BEAT_v2 Dataset for VAE training
+        Args:
+            mean: mean for normalization
+            std: std for normalization
+            data_root: root directory of BEAT_v2 data (e.g., '/root/workspace/MARDM/data/BEAT_v2')
+            window_size: window size for training
+            split: 'train' or 'val'
+            train_ratio: ratio of training data
+        """
+        self.data = []
+        self.lengths = []
+        self.window_size = window_size
+        self.mean = mean
+        self.std = std
+        
+        # Find all npz files
+        npz_files = []
+        for root, dirs, files in os.walk(data_root):
+            for file in files:
+                if file.endswith('.npz'):
+                    npz_files.append(os.path.join(root, file))
+        
+        npz_files.sort()  # Ensure consistent ordering
+        random.seed(42)  # Fixed seed for reproducibility
+        random.shuffle(npz_files)
+        
+        # Split train/val
+        split_idx = int(len(npz_files) * train_ratio)
+        if split == 'train':
+            npz_files = npz_files[:split_idx]
+        else:
+            npz_files = npz_files[split_idx:]
+        
+        print(f"Loading {split} data from {len(npz_files)} files...")
+        
+        for npz_path in tqdm(npz_files):
+            try:
+                data = np.load(npz_path)
+                if 'qpos' in data:
+                    motion = data['qpos']
+                else:
+                    # Try to get the first array if qpos doesn't exist
+                    keys = list(data.keys())
+                    if len(keys) > 0:
+                        motion = data[keys[0]]
+                    else:
+                        continue
+                
+                if motion.shape[0] < window_size:
+                    continue
+                
+                # Ensure motion is 2D
+                if len(motion.shape) == 1:
+                    motion = motion.reshape(-1, 1)
+                
+                self.lengths.append(motion.shape[0] - window_size)
+                self.data.append(motion)
+            except Exception as e:
+                print(f"Error loading {npz_path}: {e}")
+                continue
+        
+        self.cumsum = np.cumsum([0] + self.lengths)
+        print("Total number of motions {}, snippets {}".format(len(self.data), self.cumsum[-1]))
+    
+    def __len__(self):
+        return self.cumsum[-1]
+    
+    def __getitem__(self, item):
+        if item != 0:
+            motion_id = np.searchsorted(self.cumsum, item) - 1
+            idx = item - self.cumsum[motion_id] - 1
+        else:
+            motion_id = 0
+            idx = 0
+        
+        motion = self.data[motion_id][idx:idx + self.window_size]
+        
+        # Z Normalization
+        # Handle dimension mismatch
+        min_dim = min(motion.shape[1], self.mean.shape[0])
+        motion = motion[:, :min_dim]
+        mean_subset = self.mean[:min_dim]
+        std_subset = self.std[:min_dim]
+        
+        # Avoid division by zero
+        std_subset = np.where(std_subset < 1e-8, 1.0, std_subset)
+        
+        motion = (motion - mean_subset) / std_subset
+        
+        # Pad if necessary
+        if motion.shape[1] < self.mean.shape[0]:
+            padding = np.zeros((motion.shape[0], self.mean.shape[0] - motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=1)
+        
         return motion
 
 

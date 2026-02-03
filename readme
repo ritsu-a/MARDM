@@ -5,9 +5,43 @@ Visualization of vanilla MARDM:
 Visualization of source motion:
     python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/BEAT_v2/1/1_wayne_0_1_1.npz
 
+Visualize VAE comparison (original vs reconstructed):
+    python vis_AE_comparison.py --npz_path checkpoints/beat_v2/AE/test_results/sample_0000.npz --output_path videos/ae_comparison.mp4 --robot g1_branco
+
 Preprocess whisper feature of BEAT_v2:
     python utils/batch_whisper_features.py
 
+Compute mean and std of BEAT_v2:
+    python utils/cal_mean_std.py
+
+Train VAE on BEAT_v2 (8 GPUs):
+    torchrun --nproc_per_node=8 --master_port=29501 train_AE.py --name AE --dataset_name beat_v2 --batch_size 256 --epoch 50 --lr_decay 0.05 --distributed
+    Note: batch_size is per GPU, so total batch size = 256 * 8 = 2048
+    Note: Use --master_port to specify port (default: 29501, avoids 29500). Must use torchrun's --master_port, not environment variable.
+
+Train VAE on BEAT_v2 (single GPU):
+    python train_AE.py --name AE --dataset_name beat_v2 --batch_size 256 --epoch 50 --lr_decay 0.05
+
+Evaluate VAE on BEAT_v2:
+    python evaluation_AE.py --name AE --dataset_name beat_v2 --model AE_Model --batch_size 256 --window_size 180
+
+Test VAE and generate comparison videos:
+    python test_AE.py \
+        --name AE \
+        --dataset_name beat_v2 \
+        --model AE_Model \
+        --batch_size 256 \
+        --window_size 180 \
+        --num_samples 100 \
+        --sample_strategy diverse \
+        --generate_videos \
+        --num_video_samples 10 \
+        --robot_type g1_brainco \
+        --motion_fps 60 \
+        --rate_limit
+    
+    Note: Use --sample_strategy diverse (default) to ensure different motions are selected.
+          Options: sequential (order), diverse (spaced), random (completely random)
 TODO:
 train & test VAE
 
