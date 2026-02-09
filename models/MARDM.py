@@ -278,7 +278,8 @@ class MARDM(nn.Module):
                  timesteps: int,
                  cond_scale: int,
                  temperature=1,
-                 force_mask=False
+                 force_mask=False,
+                 progress_callback=None
                  ):
         device = next(self.parameters()).device
         l = max(m_lens)
@@ -312,7 +313,8 @@ class MARDM(nn.Module):
                           self.mask_latent.repeat(b, l, 1))
         masked_rand_schedule = torch.where(padding_mask, 1e5, torch.rand_like(padding_mask, dtype=torch.float))
 
-        for timestep, steps_until_x0 in zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))):
+        timestep_list = list(zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))))
+        for step_idx, (timestep, steps_until_x0) in enumerate(timestep_list):
             rand_mask_prob = cosine_schedule(timestep)
             num_masked = torch.round(rand_mask_prob * m_lens).clamp(min=1)
             sorted_indices = masked_rand_schedule.argsort(dim=1)
@@ -326,6 +328,10 @@ class MARDM(nn.Module):
             latents = torch.where(is_mask.unsqueeze(-1), logits, latents)
 
             masked_rand_schedule = masked_rand_schedule.masked_fill(~is_mask, 1e5)
+            
+            # 更新进度条
+            if progress_callback is not None:
+                progress_callback(1)
 
         latents = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(latents), latents)
         return latents.permute(0,2,1)

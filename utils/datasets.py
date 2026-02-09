@@ -171,20 +171,20 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
             std: std for normalization
             data_root: root directory of BEAT_v2 data (e.g., '/root/workspace/MARDM/data/BEAT_v2')
             unit_length: unit length for motion (default 4)
-            max_motion_length: maximum motion length (should be 180)
+            max_motion_length: maximum motion length (should be 300)
             split: 'train' or 'val'
             train_ratio: ratio of training data
         """
         self.mean = mean
         self.std = std
         self.unit_length = unit_length
-        self.max_motion_length = max_motion_length  # Should be 180
+        self.max_motion_length = max_motion_length  # Should be 300
         
         # Frame alignment: 50 audio frames = 60 motion frames
         # Ratio: audio_frames / motion_frames = 50/60 = 5/6
-        # For 180 motion frames, we need 180 * 5/6 = 150 audio frames
-        self.target_motion_frames = 180
-        self.target_audio_frames = int(self.target_motion_frames * 5 / 6)  # 150
+        # For 300 motion frames, we need 300 * 5/6 = 250 audio frames
+        self.target_motion_frames = max_motion_length  # Use max_motion_length instead of hardcoded value
+        self.target_audio_frames = int(self.target_motion_frames * 5 / 6)  # 250 for 300 motion frames
         self.audio_to_motion_ratio = 5.0 / 6.0  # 50/60
         
         # Minimum length requirement: need at least target frames
@@ -352,17 +352,17 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
         """
         Returns:
             whisper_features: [target_audio_frames, feature_dim] - fixed size audio features sequence
-            motion: [target_motion_frames, motion_dim] - fixed size motion (180 frames)
-            m_length: int - motion length (always 180)
+            motion: [target_motion_frames, motion_dim] - fixed size motion (300 frames)
+            m_length: int - motion length (always 300)
         """
         name = self.name_list[item]
         data = self.data_dict[name]
-        motion = data['motion'].copy()  # Already normalized and fixed size [180, dim]
-        whisper_features = data['whisper'].copy()  # Already fixed size [150, feature_dim]
-        m_length = data['length']  # Always 180
+        motion = data['motion'].copy()  # Already normalized and fixed size [300, dim]
+        whisper_features = data['whisper'].copy()  # Already fixed size [250, feature_dim]
+        m_length = data['length']  # Always 300
         
         # Return full sequence for cross-attention support
-        # Shape: whisper_features [150, feature_dim], motion [180, motion_dim]
+        # Shape: whisper_features [250, feature_dim], motion [300, motion_dim]
         return whisper_features, motion, m_length
 
 
