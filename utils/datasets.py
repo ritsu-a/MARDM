@@ -162,6 +162,125 @@ class BEAT_v2Dataset(data.Dataset):
         return motion
 
 
+class MixedDataset(data.Dataset):
+    """
+    Mixed dataset combining BEAT_v2 and semi_synthetic_v1_segments datasets
+    """
+    def __init__(self, mean, std, beat_v2_root, semi_synthetic_root, window_size, split='train', train_ratio=0.9):
+        """
+        Mixed Dataset for VAE training
+        Args:
+            mean: mean for normalization (should be computed from combined datasets)
+            std: std for normalization (should be computed from combined datasets)
+            beat_v2_root: root directory of BEAT_v2 data
+            semi_synthetic_root: root directory of semi_synthetic_v1_segments data
+            window_size: window size for training
+            split: 'train' or 'val'
+            train_ratio: ratio of training data
+        """
+        self.data = []
+        self.lengths = []
+        self.window_size = window_size
+        self.mean = mean
+        self.std = std
+        
+        # Collect npz files from both datasets
+        npz_files = []
+        
+        # From BEAT_v2
+        if os.path.exists(beat_v2_root):
+            for root, dirs, files in os.walk(beat_v2_root):
+                for file in files:
+                    if file.endswith('.npz') and not file.endswith('_whisper_features.npy'):
+                        npz_files.append(('beat_v2', os.path.join(root, file)))
+        
+        # From semi_synthetic_v1_segments (only *_motion.npz files)
+        if os.path.exists(semi_synthetic_root):
+            for root, dirs, files in os.walk(semi_synthetic_root):
+                for file in files:
+                    if file.endswith('_motion.npz'):
+                        npz_files.append(('semi_synthetic', os.path.join(root, file)))
+        
+        npz_files.sort(key=lambda x: x[1])  # Sort by path for reproducibility
+        random.seed(42)  # Fixed seed for reproducibility
+        random.shuffle(npz_files)
+        
+        # Split train/val
+        split_idx = int(len(npz_files) * train_ratio)
+        if split == 'train':
+            npz_files = npz_files[:split_idx]
+        else:
+            npz_files = npz_files[split_idx:]
+        
+        print(f"Loading {split} data from {len(npz_files)} files (BEAT_v2 + semi_synthetic_v1_segments)...")
+        
+        beat_v2_count = sum(1 for dataset_type, path in npz_files if dataset_type == 'beat_v2')
+        semi_synthetic_count = len(npz_files) - beat_v2_count
+        print(f"  - BEAT_v2: {beat_v2_count} files")
+        print(f"  - semi_synthetic_v1_segments: {semi_synthetic_count} files")
+        
+        for dataset_type, npz_path in tqdm(npz_files, desc=f"Loading {split} data"):
+            try:
+                data = np.load(npz_path)
+                if 'qpos' in data:
+                    motion = data['qpos']
+                else:
+                    # Try to get the first array if qpos doesn't exist
+                    keys = list(data.keys())
+                    if len(keys) > 0:
+                        motion = data[keys[0]]
+                    else:
+                        continue
+                
+                if motion.shape[0] < window_size:
+                    continue
+                
+                # Ensure motion is 2D
+                if len(motion.shape) == 1:
+                    motion = motion.reshape(-1, 1)
+                
+                self.lengths.append(motion.shape[0] - window_size)
+                self.data.append(motion)
+            except Exception as e:
+                print(f"Error loading {npz_path}: {e}")
+                continue
+        
+        self.cumsum = np.cumsum([0] + self.lengths)
+        print("Total number of motions {}, snippets {}".format(len(self.data), self.cumsum[-1]))
+    
+    def __len__(self):
+        return self.cumsum[-1]
+    
+    def __getitem__(self, item):
+        if item != 0:
+            motion_id = np.searchsorted(self.cumsum, item) - 1
+            idx = item - self.cumsum[motion_id] - 1
+        else:
+            motion_id = 0
+            idx = 0
+        
+        motion = self.data[motion_id][idx:idx + self.window_size]
+        
+        # Z Normalization
+        # Handle dimension mismatch
+        min_dim = min(motion.shape[1], self.mean.shape[0])
+        motion = motion[:, :min_dim]
+        mean_subset = self.mean[:min_dim]
+        std_subset = self.std[:min_dim]
+        
+        # Avoid division by zero
+        std_subset = np.where(std_subset < 1e-8, 1.0, std_subset)
+        
+        motion = (motion - mean_subset) / std_subset
+        
+        # Pad if necessary
+        if motion.shape[1] < self.mean.shape[0]:
+            padding = np.zeros((motion.shape[0], self.mean.shape[0] - motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=1)
+        
+        return motion
+
+
 class BEAT_v2Audio2MotionDataset(data.Dataset):
     def __init__(self, mean, std, data_root, unit_length, max_motion_length, split='train', train_ratio=0.9):
         """

@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 from models.AE import AE_models
 from utils.evaluators import Evaluators
-from utils.datasets import AEDataset, Text2MotionDataset, BEAT_v2Dataset, collate_fn
+from utils.datasets import AEDataset, Text2MotionDataset, BEAT_v2Dataset, MixedDataset, collate_fn
 import time
 from collections import OrderedDict, defaultdict
 from utils.train_utils import update_lr_warm_up, def_value, save, print_current_loss
@@ -71,13 +71,15 @@ def main(args):
     #################################################################################
     #                                    Train Data                                 #
     #################################################################################
-    if args.dataset_name == "beat_v2":
-        # BEAT_v2 dataset
-        data_root = '/root/workspace/MARDM/data/BEAT_v2'
+    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+        # Mixed dataset (BEAT_v2 + semi_synthetic_v1_segments)
+        beat_v2_root = '/root/workspace/MARDM/data/BEAT_v2'
+        semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
         
-        # Load pre-computed mean and std
-        mean_path = pjoin(data_root, 'Mean.npy')
-        std_path = pjoin(data_root, 'Std.npy')
+        # Load pre-computed mean and std from BEAT_v2 (used as base)
+        # For mixed dataset, we use BEAT_v2's mean/std as they should be similar
+        mean_path = pjoin(beat_v2_root, 'Mean.npy')
+        std_path = pjoin(beat_v2_root, 'Std.npy')
         
         if os.path.exists(mean_path) and os.path.exists(std_path):
             mean = np.load(mean_path)
@@ -92,12 +94,18 @@ def main(args):
             )
         
         dim_pose = mean.shape[0]
-        joints_num = dim_pose  # For BEAT_v2, we use the full dimension
+        joints_num = dim_pose
         
-        train_dataset = BEAT_v2Dataset(mean, std, data_root, args.window_size, split='train')
-        val_dataset = BEAT_v2Dataset(mean, std, data_root, args.window_size, split='val')
+        if args.dataset_name == "mixed":
+            # Use mixed dataset
+            train_dataset = MixedDataset(mean, std, beat_v2_root, semi_synthetic_root, args.window_size, split='train')
+            val_dataset = MixedDataset(mean, std, beat_v2_root, semi_synthetic_root, args.window_size, split='val')
+        else:
+            # Use only BEAT_v2 dataset
+            train_dataset = BEAT_v2Dataset(mean, std, beat_v2_root, args.window_size, split='train')
+            val_dataset = BEAT_v2Dataset(mean, std, beat_v2_root, args.window_size, split='val')
         
-        # For evaluation, we still need Text2MotionDataset but it won't be used for BEAT_v2
+        # For evaluation, we still need Text2MotionDataset but it won't be used
         max_motion_length = 180
         eval_mean = mean
         eval_std = std
@@ -152,8 +160,8 @@ def main(args):
     #################################################################################
     #                                    Eval Data                                  #
     #################################################################################
-    if args.dataset_name == "beat_v2":
-        # For BEAT_v2, we skip the text-based evaluation dataset
+    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+        # For BEAT_v2/mixed, we skip the text-based evaluation dataset
         eval_loader = None
         eval_wrapper = None
     else:
@@ -186,7 +194,7 @@ def main(args):
     else:
         ae_model = ae
     
-    if args.dataset_name != "beat_v2":
+    if args.dataset_name not in ["beat_v2", "mixed"]:
         eval_wrapper = Evaluators(args.dataset_name, device=device)
     else:
         eval_wrapper = None
@@ -247,9 +255,9 @@ def main(args):
 
             loss_rec = criterion(pred_motion, motions)
             
-            # For BEAT_v2, we use a simpler loss (only reconstruction)
+            # For BEAT_v2/mixed, we use a simpler loss (only reconstruction)
             # For other datasets, we use the original joint-based loss
-            if args.dataset_name == "beat_v2":
+            if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
                 loss = loss_rec
                 loss_explicit = torch.tensor(0.0)
             else:
@@ -302,8 +310,8 @@ def main(args):
 
                 loss_rec = criterion(pred_motion, motions)
                 
-                # For BEAT_v2, we use a simpler loss (only reconstruction)
-                if args.dataset_name == "beat_v2":
+                # For BEAT_v2/mixed, we use a simpler loss (only reconstruction)
+                if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
                     loss = loss_rec
                     loss_explicit = torch.tensor(0.0)
                 else:
@@ -324,14 +332,14 @@ def main(args):
             print('Validation Loss: %.5f, Reconstruction: %.5f, Velocity: %.5f,' %
                   (sum(val_loss) / len(val_loss), sum(val_loss_rec) / len(val_loss), sum(val_loss_vel) / len(val_loss)))
 
-        if args.dataset_name != "beat_v2" and eval_loader is not None and is_main_process:
+        if args.dataset_name not in ["beat_v2", "mixed"] and eval_loader is not None and is_main_process:
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, mpjpe, writer = evaluation_ae(
                 model_dir, eval_loader, ae_model, logger, epoch-1, device=device, num_joint=joints_num, best_fid=best_fid,
                 best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
                 train_mean=mean, train_std=std, best_matching=best_matching, eval_wrapper=eval_wrapper)
             print(f'best fid {best_fid}')
-        elif args.dataset_name == "beat_v2" and is_main_process:
-            print("Skipping evaluation for BEAT_v2 dataset")
+        elif args.dataset_name in ["beat_v2", "mixed"] and is_main_process:
+            print(f"Skipping evaluation for {args.dataset_name} dataset")
     
     if args.distributed:
         dist.destroy_process_group()

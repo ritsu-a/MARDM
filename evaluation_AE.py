@@ -6,7 +6,7 @@ import random
 from torch.utils.data import DataLoader
 from models.AE import AE_models
 from utils.evaluators import Evaluators
-from utils.datasets import Text2MotionDataset, BEAT_v2Dataset, collate_fn
+from utils.datasets import Text2MotionDataset, BEAT_v2Dataset, MixedDataset, collate_fn
 from utils.eval_utils import evaluation_ae
 import warnings
 warnings.filterwarnings('ignore')
@@ -25,20 +25,25 @@ def main(args):
     #################################################################################
     #                                    Eval Data                                  #
     #################################################################################
-    if args.dataset_name == "beat_v2":
-        # BEAT_v2 dataset
-        data_root = '/root/workspace/MARDM/data/BEAT_v2'
-        mean = np.load(pjoin(data_root, 'Mean.npy'))
-        std = np.load(pjoin(data_root, 'Std.npy'))
-        dim_pose = mean.shape[0]
-        joints_num = dim_pose  # For BEAT_v2, we use the full dimension
+    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+        # Mixed dataset (BEAT_v2 + semi_synthetic_v1_segments) or BEAT_v2 only
+        beat_v2_root = '/root/workspace/MARDM/data/BEAT_v2'
+        semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
         
-        # Use validation split for evaluation
-        eval_dataset = BEAT_v2Dataset(mean, std, data_root, args.window_size, split='val')
+        mean = np.load(pjoin(beat_v2_root, 'Mean.npy'))
+        std = np.load(pjoin(beat_v2_root, 'Std.npy'))
+        dim_pose = mean.shape[0]
+        joints_num = dim_pose
+        
+        if args.dataset_name == "mixed":
+            eval_dataset = MixedDataset(mean, std, beat_v2_root, semi_synthetic_root, args.window_size, split='val')
+        else:
+            eval_dataset = BEAT_v2Dataset(mean, std, beat_v2_root, args.window_size, split='val')
+        
         eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
                                 shuffle=False, pin_memory=True)
         
-        eval_wrapper = None  # No text-based evaluation for BEAT_v2
+        eval_wrapper = None  # No text-based evaluation for BEAT_v2/mixed
         
     elif args.dataset_name == "t2m":
         data_root = f'{args.dataset_dir}/HumanML3D/'
@@ -80,7 +85,7 @@ def main(args):
     model_dir = pjoin(args.checkpoints_dir, args.dataset_name, args.name, 'model')
 
     ae = AE_models[args.model](input_width=dim_pose)
-    checkpoint_path = os.path.join(model_dir, 'latest.tar' if args.dataset_name == 't2m' or args.dataset_name == 'beat_v2' else 'net_best_fid.tar')
+    checkpoint_path = os.path.join(model_dir, 'latest.tar' if args.dataset_name in ['t2m', 'beat_v2', 'mixed'] else 'net_best_fid.tar')
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     ae.load_state_dict(checkpoint['ae'])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,8 +99,8 @@ def main(args):
     ae.eval()
     ae.to(device)
 
-    if args.dataset_name == "beat_v2":
-        # Simplified evaluation for BEAT_v2 (no text-based metrics)
+    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+        # Simplified evaluation for BEAT_v2/mixed (no text-based metrics)
         fid = []
         div = []
         top1 = []
@@ -175,7 +180,7 @@ def main(args):
     print(f'final result')
     print(f'final result', file=f, flush=True)
 
-    if args.dataset_name == "beat_v2":
+    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
         reconstruction_losses = np.array(reconstruction_losses)
         msg_final = f"\tReconstruction Loss (MSE): {np.mean(reconstruction_losses):.6f}, conf. {np.std(reconstruction_losses) * 1.96 / np.sqrt(repeat_time):.6f}\n" \
                     f"\tReconstruction Loss (L1/MAE): {np.mean(mae):.6f}, conf. {np.std(mae) * 1.96 / np.sqrt(repeat_time):.6f}\n" \

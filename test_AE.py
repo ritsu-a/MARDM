@@ -7,7 +7,8 @@ import numpy as np
 import random
 from torch.utils.data import DataLoader
 from models.AE import AE_models
-from utils.datasets import BEAT_v2Dataset, AEDataset, Text2MotionDataset
+from utils.datasets import BEAT_v2Dataset, AEDataset, Text2MotionDataset, MixedDataset
+from moviepy.editor import VideoFileClip, AudioFileClip
 import argparse
 from tqdm import tqdm
 import tempfile
@@ -109,6 +110,66 @@ def add_text_to_video(video_path, output_path, text, position='top-left', font_s
     reader.close()
     writer.close()
 
+def combine_video_with_audio(video_path, audio_path, output_path):
+    """
+    将视频和音频合并
+    
+    参数:
+    video_path: 视频文件路径
+    audio_path: 音频文件路径（可选，为None或空字符串时只复制视频）
+    output_path: 输出文件路径
+    """
+    # 如果没有音频路径，直接复制视频文件
+    if audio_path is None or not os.path.exists(audio_path):
+        if os.path.abspath(video_path) != os.path.abspath(output_path):
+            shutil.copy2(video_path, output_path)
+        return
+    
+    # 如果源文件路径和目标文件路径相同，需要先将文件复制到临时位置
+    temp_video = video_path
+    if os.path.abspath(video_path) == os.path.abspath(output_path):
+        temp_video = video_path + ".temp.mp4"
+        shutil.copy2(video_path, temp_video)
+    
+    try:
+        # 加载视频文件
+        final_clip = VideoFileClip(temp_video)
+        
+        # 加载音频文件
+        audio = AudioFileClip(audio_path)
+        
+        # 设置视频的音频
+        # 如果音频长度超过视频长度，截取音频；如果短于视频，循环音频
+        if audio.duration > final_clip.duration:
+            audio = audio.subclip(0, final_clip.duration)
+        elif audio.duration < final_clip.duration:
+            # 如果音频短于视频，循环音频
+            num_loops = int(np.ceil(final_clip.duration / audio.duration))
+            audio = audio.loop(n=num_loops).subclip(0, final_clip.duration)
+        
+        # 设置音频
+        final_clip = final_clip.set_audio(audio)
+        
+        # 导出最终视频
+        final_clip.write_videofile(
+            output_path,
+            codec='libx264',
+            audio_codec='aac',
+            temp_audiofile='temp-audio.m4a',
+            remove_temp=True,
+            verbose=False,
+            logger=None
+        )
+        
+        # 关闭所有剪辑以释放资源
+        audio.close()
+        final_clip.close()
+    finally:
+        # 如果使用了临时文件，删除它
+        if temp_video != video_path and os.path.exists(temp_video):
+            os.remove(temp_video)
+
+
 def concatenate_videos_horizontally(video1_path, video2_path, output_path):
     """Concatenate two videos horizontally"""
     reader1 = imageio.get_reader(video1_path)
@@ -158,18 +219,30 @@ def main(args):
     #################################################################################
     #                                    Test Data                                  #
     #################################################################################
-    if args.dataset_name == "beat_v2":
-        # BEAT_v2 dataset
-        data_root = '/root/workspace/MARDM/data/BEAT_v2'
-        mean = np.load(pjoin(data_root, 'Mean.npy'))
-        std = np.load(pjoin(data_root, 'Std.npy'))
+    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+        # BEAT_v2 dataset or mixed dataset
+        beat_v2_root = '/root/workspace/MARDM/data/BEAT_v2'
+        semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
+        
+        mean = np.load(pjoin(beat_v2_root, 'Mean.npy'))
+        std = np.load(pjoin(beat_v2_root, 'Std.npy'))
         dim_pose = mean.shape[0]
         joints_num = dim_pose
         
-        # Use validation split for testing
-        test_dataset = BEAT_v2Dataset(mean, std, data_root, args.window_size, split='val')
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False, 
-                                num_workers=args.num_workers, shuffle=False, pin_memory=True)
+        if args.dataset_name == "mixed":
+            # Create separate datasets for sampling
+            beat_v2_dataset = BEAT_v2Dataset(mean, std, beat_v2_root, args.window_size, split='val')
+            semi_synthetic_dataset = MixedDataset(mean, std, beat_v2_root, semi_synthetic_root, args.window_size, split='val')
+            
+            # Use MixedDataset for loading, but we'll sample separately
+            test_dataset = MixedDataset(mean, std, beat_v2_root, semi_synthetic_root, args.window_size, split='val')
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False, 
+                                    num_workers=args.num_workers, shuffle=False, pin_memory=True)
+        else:
+            # Use validation split for testing
+            test_dataset = BEAT_v2Dataset(mean, std, beat_v2_root, args.window_size, split='val')
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False, 
+                                    num_workers=args.num_workers, shuffle=False, pin_memory=True)
         
     elif args.dataset_name == "t2m":
         data_root = f'{args.dataset_dir}/HumanML3D/'
@@ -208,7 +281,7 @@ def main(args):
     #                                      Models                                   #
     #################################################################################
     model_dir = pjoin(args.checkpoints_dir, args.dataset_name, args.name, 'model')
-    checkpoint_path = os.path.join(model_dir, 'latest.tar' if args.dataset_name == 't2m' or args.dataset_name == 'beat_v2' else 'net_best_fid.tar')
+    checkpoint_path = os.path.join(model_dir, 'latest.tar' if args.dataset_name in ['t2m', 'beat_v2', 'mixed'] else 'net_best_fid.tar')
     
     print(f"Loading model from {checkpoint_path}")
     ae = AE_models[args.model](input_width=dim_pose)
