@@ -17,7 +17,7 @@ class MARDM(nn.Module):
     def __init__(self, ae_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
                  num_heads=4, dropout=0.2, clip_dim=512,
                  diffmlps_batch_mul=4, diffmlps_model='SiT-XL', cond_drop_prob=0.1,
-                 clip_version='ViT-B/32', **kargs):
+                 motion_cond_drop_prob=0.3, clip_version='ViT-B/32', **kargs):
         super(MARDM, self).__init__()
 
         self.ae_dim = ae_dim
@@ -27,6 +27,7 @@ class MARDM(nn.Module):
 
         self.cond_mode = cond_mode
         self.cond_drop_prob = cond_drop_prob
+        self.motion_cond_drop_prob = motion_cond_drop_prob  # Probability of dropping/replacing motion condition with noise
 
         if self.cond_mode == 'action':
             assert 'num_actions' in kargs
@@ -176,12 +177,49 @@ class MARDM(nn.Module):
                 x = block(x, cond, padding_mask)
         return x
 
-    def forward_loss(self, latents, y, m_lens):
-        latents = latents.permute(0, 2, 1)
+    def forward_loss(self, latents, y, m_lens, motion_condition_latent=None):
+        """
+        Args:
+            latents: target motion latents [B, ae_dim, L] where L is target length (240 frames in latent space = 60)
+            y: audio features [B, T_audio, audio_dim] or other condition
+            m_lens: target motion lengths in latent space [B]
+            motion_condition_latent: condition motion latents [B, ae_dim, L_cond] where L_cond is condition length (60 frames in latent space = 15)
+        """
+        latents = latents.permute(0, 2, 1)  # [B, ae_dim, L] -> [B, L, ae_dim]
         b, l, d = latents.shape
         device = latents.device
 
-        non_pad_mask = lengths_to_mask(m_lens, l)
+        # Apply motion condition dropout: randomly replace with noise or set to None
+        if motion_condition_latent is not None:
+            motion_condition_latent = motion_condition_latent.permute(0, 2, 1)  # [B, ae_dim, L_cond] -> [B, L_cond, ae_dim]
+            l_cond = motion_condition_latent.shape[1]
+            
+            if self.training and self.motion_cond_drop_prob > 0.:
+                # Randomly drop/replace motion condition
+                drop_mask = torch.bernoulli(torch.ones(b, device=device) * self.motion_cond_drop_prob).view(b, 1, 1)
+                
+                # Option 1: Replace with random noise (same shape)
+                noise_condition = torch.randn_like(motion_condition_latent)
+                motion_condition_latent = torch.where(
+                    drop_mask.bool(),
+                    noise_condition,
+                    motion_condition_latent
+                )
+                
+                # Option 2: Set to None (completely remove condition)
+                # For now, we use Option 1 (random noise) to maintain shape consistency
+                # If we want Option 2, we need to handle None case differently
+            
+            # Concatenate: condition (first) + target (last)
+            latents = torch.cat([motion_condition_latent, latents], dim=1)  # [B, L_cond + L, ae_dim]
+            l_total = l_cond + l
+            m_lens_total = m_lens + l_cond  # Total length including condition
+        else:
+            l_total = l
+            m_lens_total = m_lens
+            l_cond = 0
+
+        non_pad_mask = lengths_to_mask(m_lens_total, l_total)
         latents = torch.where(non_pad_mask.unsqueeze(-1), latents, torch.zeros_like(latents))
 
         target = latents.clone().detach()
@@ -222,20 +260,28 @@ class MARDM(nn.Module):
 
         rand_time = uniform((b,), device=device)
         rand_mask_probs = cosine_schedule(rand_time)
-        num_masked = (l * rand_mask_probs).round().clamp(min=1)
-        batch_randperm = torch.rand((b, l), device=device).argsort(dim=-1)
+        # Only mask target frames (after condition), not condition frames
+        num_masked = (l * rand_mask_probs).round().clamp(min=1)  # Mask only target length
+        batch_randperm = torch.rand((b, l_total), device=device).argsort(dim=-1)
+        # Create mask only for target positions (skip condition frames)
         mask = batch_randperm < num_masked.unsqueeze(-1)
+        # Shift mask to target positions (skip first l_cond frames)
+        if l_cond > 0:
+            # Only mask positions >= l_cond (target region)
+            mask_full = torch.zeros((b, l_total), device=device, dtype=torch.bool)
+            mask_full[:, l_cond:] = mask[:, :l]  # Place mask in target region
+            mask = mask_full
         mask &= non_pad_mask
         mask_rlatents = get_mask_subset_prob(mask, 0.1)
         rand_latents = torch.randn_like(input)
         input = torch.where(mask_rlatents.unsqueeze(-1), rand_latents, input)
         mask_mlatents = get_mask_subset_prob(mask & ~mask_rlatents, 0.88)
-        input = torch.where(mask_mlatents.unsqueeze(-1), self.mask_latent.repeat(b, l, 1), input)
+        input = torch.where(mask_mlatents.unsqueeze(-1), self.mask_latent.repeat(b, l_total, 1), input)
 
         z = self.forward(input, cond_vector, ~non_pad_mask, force_mask, audio_seq=audio_seq, audio_mask=audio_mask)
-        target = target.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
-        z = z.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
-        mask = mask.reshape(b * l).repeat(self.diffmlps_batch_mul)
+        target = target.reshape(b * l_total, -1).repeat(self.diffmlps_batch_mul, 1)
+        z = z.reshape(b * l_total, -1).repeat(self.diffmlps_batch_mul, 1)
+        mask = mask.reshape(b * l_total).repeat(self.diffmlps_batch_mul)
         target = target[mask]
         z = z[mask]
         loss = self.DiffMLPs(z=z, target=target)
@@ -279,11 +325,29 @@ class MARDM(nn.Module):
                  cond_scale: int,
                  temperature=1,
                  force_mask=False,
-                 progress_callback=None
+                 progress_callback=None,
+                 motion_condition_latent=None
                  ):
+        """
+        Args:
+            conds: audio features [B, T_audio, audio_dim] or other condition
+            m_lens: target motion lengths in latent space [B] (e.g., 60 for 240 frames)
+            motion_condition_latent: condition motion latents [B, ae_dim, L_cond] where L_cond is condition length (e.g., 15 for 60 frames)
+        """
         device = next(self.parameters()).device
-        l = max(m_lens)
+        l = max(m_lens)  # Target length in latent space
         b = len(m_lens)
+
+        # If motion_condition_latent is provided, concatenate it with target latents
+        if motion_condition_latent is not None:
+            motion_condition_latent = motion_condition_latent.permute(0, 2, 1)  # [B, ae_dim, L_cond] -> [B, L_cond, ae_dim]
+            l_cond = motion_condition_latent.shape[1]
+            l_total = l_cond + l
+            m_lens_total = m_lens + l_cond
+        else:
+            l_cond = 0
+            l_total = l
+            m_lens_total = m_lens
 
         audio_seq = None
         audio_mask = None
@@ -307,21 +371,58 @@ class MARDM(nn.Module):
         else:
             raise NotImplementedError("Unsupported condition mode!!!")
 
-        padding_mask = ~lengths_to_mask(m_lens, l)
+        padding_mask = ~lengths_to_mask(m_lens_total, l_total)
 
-        latents = torch.where(padding_mask.unsqueeze(-1), torch.zeros(b, l, self.ae_dim).to(device),
-                          self.mask_latent.repeat(b, l, 1))
-        masked_rand_schedule = torch.where(padding_mask, 1e5, torch.rand_like(padding_mask, dtype=torch.float))
+        # Initialize latents: condition frames (if provided) + masked target frames
+        if motion_condition_latent is not None:
+            # Condition frames are fixed, target frames start as masked
+            target_latents = torch.where(
+                padding_mask[:, l_cond:].unsqueeze(-1), 
+                torch.zeros(b, l, self.ae_dim).to(device),
+                self.mask_latent.repeat(b, l, 1)
+            )
+            latents = torch.cat([motion_condition_latent, target_latents], dim=1)  # [B, L_cond + L, ae_dim]
+        else:
+            latents = torch.where(
+                padding_mask.unsqueeze(-1), 
+                torch.zeros(b, l, self.ae_dim).to(device),
+                self.mask_latent.repeat(b, l, 1)
+            )
+        
+        # Create masked_rand_schedule only for target frames (skip condition frames)
+        if motion_condition_latent is not None:
+            masked_rand_schedule = torch.where(
+                padding_mask[:, l_cond:], 
+                1e5, 
+                torch.rand_like(padding_mask[:, l_cond:], dtype=torch.float)
+            )
+            # Pad with 1e5 for condition frames (never mask them)
+            masked_rand_schedule = torch.cat([
+                torch.ones(b, l_cond, device=device, dtype=torch.float) * 1e5,
+                masked_rand_schedule
+            ], dim=1)
+        else:
+            masked_rand_schedule = torch.where(
+                padding_mask, 
+                1e5, 
+                torch.rand_like(padding_mask, dtype=torch.float)
+            )
 
         timestep_list = list(zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))))
         for step_idx, (timestep, steps_until_x0) in enumerate(timestep_list):
             rand_mask_prob = cosine_schedule(timestep)
-            num_masked = torch.round(rand_mask_prob * m_lens).clamp(min=1)
+            # Only mask target frames (not condition frames)
+            num_masked = torch.round(rand_mask_prob * m_lens).clamp(min=1)  # Mask only target length
             sorted_indices = masked_rand_schedule.argsort(dim=1)
             ranks = sorted_indices.argsort(dim=1)
-            is_mask = (ranks < num_masked.unsqueeze(-1))
+            # Create mask only for target positions (skip condition frames)
+            if motion_condition_latent is not None:
+                # Only mask positions >= l_cond (target region)
+                is_mask = (ranks < (num_masked + l_cond).unsqueeze(-1)) & (ranks >= l_cond)
+            else:
+                is_mask = (ranks < num_masked.unsqueeze(-1))
 
-            latents = torch.where(is_mask.unsqueeze(-1), self.mask_latent.repeat(b, l, 1), latents)
+            latents = torch.where(is_mask.unsqueeze(-1), self.mask_latent.repeat(b, l_total, 1), latents)
             logits = self.forward_with_CFG(latents, cond_vector=cond_vector, padding_mask=padding_mask,
                                                   cfg=cond_scale, mask=is_mask, force_mask=force_mask,
                                                   audio_seq=audio_seq, audio_mask=audio_mask)
@@ -334,7 +435,13 @@ class MARDM(nn.Module):
                 progress_callback(1)
 
         latents = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(latents), latents)
-        return latents.permute(0,2,1)
+        
+        # Return only target latents (skip condition frames)
+        if motion_condition_latent is not None:
+            target_latents = latents[:, l_cond:, :]  # [B, L, ae_dim]
+            return target_latents.permute(0, 2, 1)  # [B, ae_dim, L]
+        else:
+            return latents.permute(0, 2, 1)
 
     @torch.no_grad()
     @eval_decorator
@@ -420,9 +527,15 @@ class MARDM(nn.Module):
 #                                     MARDM Zoos                                #
 #################################################################################
 def mardm_ddpm_xl(**kwargs):
+    # Set default motion_cond_drop_prob if not provided in kwargs
+    if 'motion_cond_drop_prob' not in kwargs:
+        kwargs['motion_cond_drop_prob'] = 0.3
     return MARDM(latent_dim=1024, ff_size=4096, num_layers=1, num_heads=16, dropout=0.2, clip_dim=512,
                  diffmlps_model="DDPM-XL", diffmlps_batch_mul=4, cond_drop_prob=0.1, **kwargs)
 def mardm_sit_xl(**kwargs):
+    # Set default motion_cond_drop_prob if not provided in kwargs
+    if 'motion_cond_drop_prob' not in kwargs:
+        kwargs['motion_cond_drop_prob'] = 0.3
     return MARDM(latent_dim=1024, ff_size=4096, num_layers=1, num_heads=16, dropout=0.2, clip_dim=512,
                  diffmlps_model="SiT-XL", diffmlps_batch_mul=4, cond_drop_prob=0.1, **kwargs)
 

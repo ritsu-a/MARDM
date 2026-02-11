@@ -237,46 +237,62 @@ def test_on_testset(args):
     num_samples = min(args.num_test_samples, len(test_dataset))
     
     with torch.no_grad():
-        for idx, (whisper_features, motion_gt, m_lens) in enumerate(tqdm(test_loader, desc="Testing batches")):
+        for idx, (whisper_features, motion_condition, motion_target, m_lens) in enumerate(tqdm(test_loader, desc="Testing batches")):
             if idx * args.batch_size >= num_samples:
                 break
             
             # 移动到设备
             whisper_features = whisper_features.to(device).float()  # [B, 250, 512]
-            # m_lens from dataset is in motion frame space (300), need to convert to latent space (300/4 = 75)
-            m_lens_latent = (m_lens // 4).to(device).long()  # Convert to latent space length
+            motion_condition = motion_condition.to(device).float()  # [B, 60, dim_pose]
+            motion_target = motion_target.to(device).float()  # [B, 240, dim_pose]
+            m_lens = m_lens.to(device).long()  # Total length: 300
+            
+            # Encode condition motion to latent
+            motion_condition_latent = ae.encode(motion_condition)  # [B, ae_dim, 15] (60/4=15)
+            
+            # Target length in latent space: 60 (for 240 frames)
+            m_lens_target = torch.tensor([240 // 4] * whisper_features.size(0), device=device).long()  # [B] = [60]
             
             # 生成motion（带进度条）
             # whisper_features shape: [B, 250, 512]
-            # m_lens_latent: [B] - motion lengths in latent space (300/4 = 75)
+            # m_lens_target: [B] - target motion lengths in latent space (240/4 = 60)
+            # motion_condition_latent: [B, ae_dim, 15] - condition motion latents (60/4 = 15)
             with tqdm(total=args.time_steps, desc=f"  Generating batch {idx+1}", leave=False) as pbar:
                 pred_latents = ema_mardm.generate(
                     conds=whisper_features,  # [B, 250, 512]
-                    m_lens=m_lens_latent,  # [B] - latent lengths (300)
+                    m_lens=m_lens_target,  # [B] - latent lengths (60 for 240 frames)
                     timesteps=args.time_steps,
                     cond_scale=args.cfg,
                     temperature=args.temperature,
-                    progress_callback=lambda step: pbar.update(1)
+                    progress_callback=lambda step: pbar.update(1),
+                    motion_condition_latent=motion_condition_latent  # [B, ae_dim, 15]
                 )
             # 解码motion
-            # pred_latents shape: [B, ae_dim, L] where L is latent sequence length
+            # pred_latents shape: [B, ae_dim, 60] where 60 is latent sequence length for 240 frames
             # ae.decode expects [B, C, T] format and outputs [B, T, dim_pose] (decoder has permute at the end)
-            pred_motions = ae.decode(pred_latents)  # [B, T, dim_pose] where T = L * 4
+            pred_motions = ae.decode(pred_latents)  # [B, 240, dim_pose]
             pred_motions = pred_motions.detach().cpu().numpy()
+            
+            # Concatenate condition + predicted motion
+            motion_condition_np = motion_condition.detach().cpu().numpy()
+            pred_motions_full = np.concatenate([motion_condition_np, pred_motions], axis=1)  # [B, 300, dim_pose]
             
             # Debug: 检查形状（仅第一个batch）
             if idx == 0:
+                print(f"Debug: motion_condition.shape = {motion_condition.shape}")
+                print(f"Debug: motion_condition_latent.shape = {motion_condition_latent.shape}")
                 print(f"Debug: pred_latents.shape = {pred_latents.shape}")
                 print(f"Debug: pred_motions.shape = {pred_motions.shape}")
+                print(f"Debug: pred_motions_full.shape = {pred_motions_full.shape}")
                 print(f"Debug: m_lens (motion frames) = {m_lens.cpu().numpy()}")
-                print(f"Debug: m_lens_latent (latent frames) = {m_lens_latent.cpu().numpy()}")
-                print(f"Debug: expected motion length = {m_lens[0].item()}")
+                print(f"Debug: m_lens_target (latent frames) = {m_lens_target.cpu().numpy()}")
             
-            pred_motions_denorm = pred_motions * std + mean
+            pred_motions_denorm = pred_motions_full * std + mean
             
-            # 处理ground truth
-            motion_gt = motion_gt.detach().cpu().numpy()
-            motion_gt_denorm = motion_gt * std + mean
+            # 处理ground truth: concatenate condition + target
+            motion_target_np = motion_target.detach().cpu().numpy()
+            motion_gt_full = np.concatenate([motion_condition_np, motion_target_np], axis=1)  # [B, 300, dim_pose]
+            motion_gt_denorm = motion_gt_full * std + mean
             
             # 保存结果
             batch_size = whisper_features.size(0)
@@ -290,7 +306,7 @@ def test_on_testset(args):
                 os.makedirs(sample_dir, exist_ok=True)
                 
                 # 预测的motion (qpos format: [frames, qpos_dim])
-                # m_lens[b] is motion length (300), pred_motions should be 300 frames
+                # Full motion: 300 frames (60 condition + 240 predicted)
                 actual_motion_len = m_lens[b].item()  # 300
                 pred_motion = pred_motions_denorm[b][:actual_motion_len]  # [300, dim_pose]
                 
@@ -369,13 +385,15 @@ def generate_from_audio_wav(args):
     print(f"Extracted features shape: {features.shape}")
     print(f"Recognized text: {text[:100]}..." if len(text) > 100 else f"Recognized text: {text}")
     
-    # 处理音频特征：需要250帧（对应300帧motion）
+    # 处理音频特征：需要250帧（对应240帧motion生成 + 60帧条件）
     # Frame alignment: 50 audio frames = 60 motion frames
     # Ratio: audio_frames / motion_frames = 50/60 = 5/6
-    # For 300 motion frames, we need 300 * 5/6 = 250 audio frames
+    # For 240 motion frames (target), we need 240 * 5/6 = 200 audio frames
+    # But we use 250 audio frames to match training (250 audio -> 240 motion target + 60 condition)
     target_audio_frames = 250
-    target_motion_frames = 300
-    target_latent_frames = target_motion_frames // 4  # 75
+    target_motion_frames_generate = 240  # Frames to generate (target)
+    condition_motion_frames = 60  # Condition frames
+    target_latent_frames = target_motion_frames_generate // 4  # 60 (for 240 frames)
     overlap_ratio = 0.5  # 50%重叠
     
     # 如果音频特征长度 < 250，填充到250帧
@@ -429,6 +447,15 @@ def generate_from_audio_wav(args):
     # 生成每个片段的motion
     motion_segments = []
     print("Generating motion for each segment...")
+    
+    # 创建初始条件motion（60帧）：使用均值姿势（rest pose）
+    condition_motion_frames = 60
+    condition_motion = np.zeros((condition_motion_frames, dim_pose))  # [60, dim_pose]
+    # 使用均值作为初始姿势（已经是归一化后的，所以均值是0）
+    # 如果需要，可以使用mean（但mean在归一化后是0）
+    condition_motion_tensor = torch.from_numpy(condition_motion).unsqueeze(0).to(device).float()  # [1, 60, dim_pose]
+    condition_motion_latent = ae.encode(condition_motion_tensor)  # [1, ae_dim, 15] (60/4=15)
+    
     with torch.no_grad():
         for seg_idx, (start_audio, end_audio) in enumerate(tqdm(audio_segments, desc="Processing segments")):
             # 提取音频片段
@@ -441,103 +468,55 @@ def generate_from_audio_wav(args):
             
             # 准备输入
             audio_features_tensor = torch.from_numpy(audio_segment).unsqueeze(0).to(device).float()  # [1, 250, 512]
-            m_lens = torch.tensor([target_latent_frames], dtype=torch.long).to(device)  # [1] = [75]
+            m_lens = torch.tensor([target_latent_frames], dtype=torch.long).to(device)  # [1] = [60]
+            
+            # 对于第一个片段，使用初始条件motion
+            # 对于后续片段，使用前一个片段生成的后60帧作为条件（实现连续性）
+            if seg_idx == 0:
+                current_condition_latent = condition_motion_latent
+            else:
+                # 使用前一个片段生成的后60帧作为条件
+                # 前一个片段生成的是240帧，取最后60帧
+                prev_motion = motion_segments[-1]  # [240, dim_pose]
+                prev_condition_motion = prev_motion[-condition_motion_frames:]  # [60, dim_pose]
+                prev_condition_motion_tensor = torch.from_numpy(prev_condition_motion).unsqueeze(0).to(device).float()
+                current_condition_latent = ae.encode(prev_condition_motion_tensor)  # [1, ae_dim, 15]
             
             # 生成motion（带进度条）
             with tqdm(total=args.time_steps, desc=f"  Segment {seg_idx+1}/{len(audio_segments)}", leave=False) as pbar:
                 pred_latents = ema_mardm.generate(
                     conds=audio_features_tensor,  # [1, 250, 512]
-                    m_lens=m_lens,  # [1] = [75]
+                    m_lens=m_lens,  # [1] = [60] for 240 frames
                     timesteps=args.time_steps,
                     cond_scale=args.cfg,
                     temperature=args.temperature,
-                    progress_callback=lambda step: pbar.update(step)
+                    progress_callback=lambda step: pbar.update(step),
+                    motion_condition_latent=current_condition_latent  # [1, ae_dim, 15]
                 )
             
             # 解码motion
-            pred_motions = ae.decode(pred_latents)  # [1, 300, dim_pose]
-            pred_motions = pred_motions.detach().cpu().numpy()[0]  # [300, dim_pose]
+            pred_motions = ae.decode(pred_latents)  # [1, 240, dim_pose]
+            pred_motions = pred_motions.detach().cpu().numpy()[0]  # [240, dim_pose]
             pred_motions_denorm = pred_motions * std + mean
             
             motion_segments.append(pred_motions_denorm)
     
-    # 拼接motion片段（带插值）
-    print("Concatenating motion segments with interpolation...")
+    # 拼接motion片段
+    # 每个片段生成240帧，需要拼接
+    print("Concatenating motion segments...")
     if len(motion_segments) == 1:
-        # 只有一个片段，直接使用
+        # 只有一个片段，直接使用（240帧）
         pred_motions_denorm = motion_segments[0]
     else:
-        # 多个片段，需要拼接
-        # 计算每个片段对应的motion帧范围
-        # audio到motion的比例：250 audio frames -> 300 motion frames
-        audio_to_motion_ratio = target_motion_frames / target_audio_frames  # 300/250 = 1.2
+        # 多个片段，直接拼接（每个片段240帧）
+        # 注意：由于每个片段使用前一个片段的后60帧作为条件，所以片段之间是连续的
+        pred_motions_denorm = np.concatenate(motion_segments, axis=0)  # [N*240, dim_pose]
         
-        # 计算每个音频片段对应的motion帧范围
-        motion_segment_ranges = []
-        for start_audio, end_audio in audio_segments:
-            start_motion = int(start_audio * audio_to_motion_ratio)
-            end_motion = int(end_audio * audio_to_motion_ratio)
-            motion_segment_ranges.append((start_motion, end_motion))
-        
-        # 计算总motion长度
-        total_motion_frames = int(total_audio_frames * audio_to_motion_ratio)
-        pred_motions_denorm = np.zeros((total_motion_frames, dim_pose))
-        
-        # 计算每个位置的权重（用于重叠区域的插值）
-        weights = np.zeros(total_motion_frames)
-        
-        # 将每个片段添加到对应位置
-        for seg_idx, (motion_seg, (start_motion, end_motion)) in enumerate(zip(motion_segments, motion_segment_ranges)):
-            actual_seg_len = min(motion_seg.shape[0], end_motion - start_motion)
-            actual_end = min(start_motion + actual_seg_len, total_motion_frames)
-            
-            # 计算重叠区域的插值权重
-            # 使用cosine插值（更平滑）：cosine插值在边界处有零导数，过渡更自然
-            overlap_size = int(target_motion_frames * overlap_ratio)  # 重叠的motion帧数
-            
-            def cosine_interpolate(start, end, n):
-                """Cosine插值：从start到end，共n个点"""
-                t = np.linspace(0, np.pi, n)
-                return start + (end - start) * (1 - np.cos(t)) / 2
-            
-            if seg_idx == 0:
-                # 第一个片段：前半部分权重为1，后半部分（重叠区域）权重从1平滑减少到0
-                seg_weights = np.ones(actual_seg_len)
-                if actual_seg_len > overlap_size:
-                    # 重叠区域权重cosine减少（更平滑）
-                    fade_out = cosine_interpolate(1.0, 0.0, overlap_size)
-                    seg_weights[-overlap_size:] = fade_out
-            elif seg_idx == len(motion_segments) - 1:
-                # 最后一个片段：前半部分（重叠区域）权重从0平滑增加到1，后半部分权重为1
-                seg_weights = np.ones(actual_seg_len)
-                if actual_seg_len > overlap_size:
-                    # 重叠区域权重cosine增加（更平滑）
-                    fade_in = cosine_interpolate(0.0, 1.0, overlap_size)
-                    seg_weights[:overlap_size] = fade_in
-            else:
-                # 中间片段：前半部分（重叠区域）权重从0平滑增加到1，后半部分（重叠区域）权重从1平滑减少到0
-                seg_weights = np.ones(actual_seg_len)
-                if actual_seg_len > 2 * overlap_size:
-                    # 前半部分重叠区域权重cosine增加（更平滑）
-                    fade_in = cosine_interpolate(0.0, 1.0, overlap_size)
-                    seg_weights[:overlap_size] = fade_in
-                    # 后半部分重叠区域权重cosine减少（更平滑）
-                    fade_out = cosine_interpolate(1.0, 0.0, overlap_size)
-                    seg_weights[-overlap_size:] = fade_out
-                elif actual_seg_len > overlap_size:
-                    # 如果片段较短，只处理前半部分
-                    fade_in = cosine_interpolate(0.0, 1.0, overlap_size)
-                    seg_weights[:overlap_size] = fade_in
-            
-            # 加权累加
-            pred_motions_denorm[start_motion:actual_end] += motion_seg[:actual_end-start_motion] * seg_weights[:actual_end-start_motion, None]
-            weights[start_motion:actual_end] += seg_weights[:actual_end-start_motion]
-        
-        # 归一化（避免除零）
-        weights[weights == 0] = 1.0
-        pred_motions_denorm = pred_motions_denorm / weights[:, None]
-        
-        print(f"Concatenated {len(motion_segments)} segments into {total_motion_frames} frames")
+        print(f"Concatenated {len(motion_segments)} segments into {pred_motions_denorm.shape[0]} frames")
+    
+    # 在开头添加初始条件motion（60帧）
+    condition_motion_denorm = condition_motion * std + mean  # [60, dim_pose]
+    pred_motions_denorm = np.concatenate([condition_motion_denorm, pred_motions_denorm], axis=0)  # [60 + N*240, dim_pose]
     
     # 创建输出目录
     audio_name = os.path.splitext(os.path.basename(args.audio_path))[0]

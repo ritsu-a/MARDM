@@ -183,7 +183,10 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
         # Frame alignment: 50 audio frames = 60 motion frames
         # Ratio: audio_frames / motion_frames = 50/60 = 5/6
         # For 300 motion frames, we need 300 * 5/6 = 250 audio frames
-        self.target_motion_frames = max_motion_length  # Use max_motion_length instead of hardcoded value
+        # New logic: 250 audio frames + 60 motion frames (condition) -> 240 motion frames (target)
+        self.target_motion_frames = max_motion_length  # 300 frames total
+        self.condition_motion_frames = 60  # First 60 frames as condition
+        self.target_motion_frames_generate = self.target_motion_frames - self.condition_motion_frames  # 240 frames to generate
         self.target_audio_frames = int(self.target_motion_frames * 5 / 6)  # 250 for 300 motion frames
         self.audio_to_motion_ratio = 5.0 / 6.0  # 50/60
         
@@ -287,6 +290,7 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
                     continue
                 
                 # Check if we have enough frames
+                # Need at least target_motion_frames (300) for motion and target_audio_frames (250) for audio
                 if motion_len < self.target_motion_frames or audio_len < self.target_audio_frames:
                     skipped_length += 1
                     continue
@@ -313,8 +317,8 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
                     if end_motion > motion_len or end_audio > audio_len:
                         continue
                     
-                    motion_segment = motion[start_motion:end_motion]
-                    audio_segment = whisper_features[start_audio:end_audio]
+                    motion_segment = motion[start_motion:end_motion]  # [300, dim]
+                    audio_segment = whisper_features[start_audio:end_audio]  # [250, feature_dim]
                     
                     # Normalize motion
                     motion_segment = motion_segment[:, :self.mean.shape[0]]
@@ -325,12 +329,18 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
                         padding = np.zeros((self.target_motion_frames - motion_segment.shape[0], motion_segment.shape[1]))
                         motion_segment = np.concatenate([motion_segment, padding], axis=0)
                     
+                    # Split motion into condition (first 60 frames) and target (last 240 frames)
+                    motion_condition = motion_segment[:self.condition_motion_frames]  # [60, dim]
+                    motion_target = motion_segment[self.condition_motion_frames:]  # [240, dim]
+                    
                     # Store data
                     name = f"{npz_stem}_sample{sample_idx}"
                     self.data_dict[name] = {
-                        'motion': motion_segment.astype(np.float32),
+                        'motion': motion_segment.astype(np.float32),  # Full 300 frames for compatibility
+                        'motion_condition': motion_condition.astype(np.float32),  # First 60 frames as condition
+                        'motion_target': motion_target.astype(np.float32),  # Last 240 frames as target
                         'whisper': audio_segment.astype(np.float32),
-                        'length': self.target_motion_frames
+                        'length': self.target_motion_frames  # Total length: 300
                     }
                     self.name_list.append(name)
                     self.length_list.append(self.target_motion_frames)
@@ -351,19 +361,21 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
     def __getitem__(self, item):
         """
         Returns:
-            whisper_features: [target_audio_frames, feature_dim] - fixed size audio features sequence
-            motion: [target_motion_frames, motion_dim] - fixed size motion (300 frames)
-            m_length: int - motion length (always 300)
+            whisper_features: [target_audio_frames, feature_dim] - fixed size audio features sequence (250 frames)
+            motion_condition: [condition_motion_frames, motion_dim] - first 60 frames as condition
+            motion_target: [target_motion_frames_generate, motion_dim] - last 240 frames as target
+            m_length: int - total motion length (300)
         """
         name = self.name_list[item]
         data = self.data_dict[name]
-        motion = data['motion'].copy()  # Already normalized and fixed size [300, dim]
-        whisper_features = data['whisper'].copy()  # Already fixed size [250, feature_dim]
+        motion_condition = data['motion_condition'].copy()  # [60, dim]
+        motion_target = data['motion_target'].copy()  # [240, dim]
+        whisper_features = data['whisper'].copy()  # [250, feature_dim]
         m_length = data['length']  # Always 300
         
-        # Return full sequence for cross-attention support
-        # Shape: whisper_features [250, feature_dim], motion [300, motion_dim]
-        return whisper_features, motion, m_length
+        # Return: audio features, condition motion (60 frames), target motion (240 frames), total length
+        # Shape: whisper_features [250, feature_dim], motion_condition [60, motion_dim], motion_target [240, motion_dim]
+        return whisper_features, motion_condition, motion_target, m_length
 
 
 class Text2MotionDataset(data.Dataset):
