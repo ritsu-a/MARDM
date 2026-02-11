@@ -48,13 +48,17 @@ class MARDM(nn.Module):
         elif self.cond_mode == 'mixed':
             # Mixed mode: both audio and text conditions
             audio_dim = kargs.get('audio_dim', 512)
-            # Text CLIP feature embedding - project to ae_dim to concatenate with motion condition
-            self.text_cond_emb = nn.Linear(self.clip_dim, self.ae_dim)
+            # Text CLIP feature projector: compress from clip_dim (512) to 32
+            clip_proj_dim = kargs.get('clip_proj_dim', 32)
+            self.clip_proj = nn.Linear(self.clip_dim, clip_proj_dim)
+            # Text CLIP feature embedding - project from compressed dim to ae_dim to concatenate with motion condition
+            self.text_cond_emb = nn.Linear(clip_proj_dim, self.ae_dim)
             # Audio feature embedding (for adaLN modulation)
             self.audio_cond_emb = nn.Linear(audio_dim, self.latent_dim)
             # Audio sequence embedding for cross-attention
             self.audio_seq_emb = nn.Linear(audio_dim, self.latent_dim)
             self.use_cross_attn = kargs.get('use_cross_attn', True)  # Enable cross-attention for audio
+            self.clip_proj_dim = clip_proj_dim
         elif self.cond_mode == 'action':
             self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
             self.use_cross_attn = False
@@ -207,15 +211,17 @@ class MARDM(nn.Module):
             
             # Process text condition and concatenate with motion condition
             if text_condition is not None and self.cond_mode == 'mixed':
-                # text_condition: [B, clip_dim] -> [B, ae_dim]
+                # text_condition: [B, clip_dim] -> [B, clip_proj_dim] -> [B, ae_dim]
                 text_tensor = text_condition.to(device).float() if torch.is_tensor(text_condition) else torch.from_numpy(text_condition).to(device).float()
                 if len(text_tensor.shape) == 1:
                     text_tensor = text_tensor.unsqueeze(0)
                 if len(text_tensor.shape) == 2 and text_tensor.shape[0] != b:
                     text_tensor = text_tensor.unsqueeze(0).expand(b, -1)
                 
-                # Project text feature to ae_dim and broadcast to each time step
-                text_feature = self.text_cond_emb(text_tensor)  # [B, ae_dim]
+                # First project CLIP feature from 512 to 32
+                text_tensor_proj = self.clip_proj(text_tensor)  # [B, clip_proj_dim (32)]
+                # Then project to ae_dim and broadcast to each time step
+                text_feature = self.text_cond_emb(text_tensor_proj)  # [B, ae_dim]
                 text_feature = text_feature.unsqueeze(1).expand(-1, l_cond, -1)  # [B, L_cond, ae_dim]
                 
                 # Concatenate text feature with motion condition (in feature dimension)
@@ -404,8 +410,10 @@ class MARDM(nn.Module):
                 if len(text_tensor.shape) == 2 and text_tensor.shape[0] != b:
                     text_tensor = text_tensor.unsqueeze(0).expand(b, -1)
                 
-                # Project text feature to ae_dim and broadcast to each time step
-                text_feature = self.text_cond_emb(text_tensor)  # [B, ae_dim]
+                # First project CLIP feature from 512 to 32
+                text_tensor_proj = self.clip_proj(text_tensor)  # [B, clip_proj_dim (32)]
+                # Then project to ae_dim and broadcast to each time step
+                text_feature = self.text_cond_emb(text_tensor_proj)  # [B, ae_dim]
                 text_feature = text_feature.unsqueeze(1).expand(-1, l_cond, -1)  # [B, L_cond, ae_dim]
                 
                 # Add text feature to motion condition

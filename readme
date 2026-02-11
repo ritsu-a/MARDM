@@ -66,6 +66,25 @@ Test MARDM (beat_v2):
     # 2. 从给定的audio wav文件生成motion并渲染成视频:
     python test_beat_v2.py --mode audio --name MARDM_SiT_XL_beat_v2 --model "MARDM-SiT-XL" --dataset_name beat_v2 --ae_name AE --audio_path /root/workspace/MARDM/data/BEAT_v2/1/1_wayne_0_2_2.wav --whisper_model base
 
+Test MARDM (mixed):
+   
+    # 1. 在test set上展示效果:
+    python test_beat_v2.py --mode testset --name MARDM_SiT_XL_mixed --model "MARDM-SiT-XL" --dataset_name mixed --ae_name AE --num_test_samples 100 --batch_size 16
+
+    # 2. 从给定的audio wav文件生成motion并渲染成视频（支持长音频）:
+    python test_beat_v2.py --mode audio --name MARDM_SiT_XL_mixed --model "MARDM-SiT-XL" --dataset_name mixed --ae_name AE --audio_path /root/workspace/MARDM/data/BEAT_v2/1/1_wayne_0_2_2.wav --whisper_model base
+    
+    # 3. 从长音频文件生成motion（自动分段处理）:
+    python test_beat_v2.py --mode audio --name MARDM_SiT_XL_mixed --model "MARDM-SiT-XL" --dataset_name mixed --ae_name AE --audio_path /path/to/long_audio.wav --whisper_model base
+
+Test MARDM (semi_synthetic):
+   
+    # 1. 在test set上展示效果:
+    python test_beat_v2.py --mode testset --name MARDM_SiT_XL_semi_synthetic --model "MARDM-SiT-XL" --dataset_name semi_synthetic --ae_name AE --num_test_samples 100 --batch_size 16
+
+    # 2. 从给定的audio wav文件生成motion并渲染成视频（支持长音频）:
+    python test_beat_v2.py --mode audio --name MARDM_SiT_XL_semi_synthetic --model "MARDM-SiT-XL" --dataset_name semi_synthetic --ae_name AE --audio_path /root/workspace/MARDM/data/BEAT_v2/1/1_wayne_0_2_2.wav --whisper_model base
+
 
 
 Process semi_synthetic_v1 to segments:
@@ -89,6 +108,33 @@ Train MARDM on mixed data:
     --milestones 20000 \
     --max_motion_length 300 \
     --distributed
+
+Train MARDM on semi-synthetic data only:
+    # 只在semi-synthetic数据集上训练 MARDM (8 GPU):
+    torchrun --master_port 29503 --nproc_per_node=8 train_MARDM.py \
+    --name MARDM_DDPM_XL_semi_synthetic_caption \
+    --model "MARDM-DDPM-XL" \
+    --dataset_name semi_synthetic \
+    --batch_size 64 \
+    --ae_name AE \
+    --milestones 20000 \
+    --max_motion_length 300 \
+    --distributed \
+    --epoch 1000
+
+    # 使用text CLIP feature噪声注入进行训练（数据增强）:
+    torchrun --master_port 29503 --nproc_per_node=8 train_MARDM.py \
+    --name MARDM_DDPM_XL_semi_synthetic_noise \
+    --model "MARDM-DDPM-XL" \
+    --dataset_name semi_synthetic \
+    --batch_size 64 \
+    --ae_name AE \
+    --milestones 20000 \
+    --max_motion_length 300 \
+    --text_clip_noise_prob 0.5 \
+    --text_clip_noise_normalize \
+    --distributed \
+    --epoch 1000
 
 
 

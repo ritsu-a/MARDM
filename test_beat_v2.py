@@ -8,7 +8,7 @@ import random
 from torch.utils.data import DataLoader
 from models.AE import AE_models
 from models.MARDM import MARDM_models
-from utils.datasets import BEAT_v2Audio2MotionDataset, collate_fn
+from utils.datasets import BEAT_v2Audio2MotionDataset, MixedAudioTextDataset, SemiSyntheticAudioTextDataset, collate_fn
 from utils.whisper_audio_feature import extract_whisper_features
 from general_motion_retargeting import RobotMotionViewer
 import argparse
@@ -199,9 +199,21 @@ def test_on_testset(args):
     std = np.load(pjoin(data_root, 'Std.npy'))
     dim_pose = mean.shape[0]
     
-    # 使用val split作为test set（因为数据集没有单独的test split）
-    test_dataset = BEAT_v2Audio2MotionDataset(mean, std, data_root, args.unit_length, 
-                                               args.max_motion_length, split='train')
+    # 根据数据集类型加载不同的数据集
+    if args.dataset_name == 'mixed':
+        beat_v2_root = '/root/workspace/MARDM/data/BEAT_v2'
+        semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
+        test_dataset = MixedAudioTextDataset(mean, std, beat_v2_root, semi_synthetic_root, 
+                                             args.unit_length, args.max_motion_length, split='val')
+    elif args.dataset_name == 'semi_synthetic':
+        semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
+        test_dataset = SemiSyntheticAudioTextDataset(mean, std, semi_synthetic_root, 
+                                                      args.unit_length, args.max_motion_length, split='val')
+    else:
+        # 使用val split作为test set（因为数据集没有单独的test split）
+        test_dataset = BEAT_v2Audio2MotionDataset(mean, std, data_root, args.unit_length, 
+                                                   args.max_motion_length, split='train')
+    
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False, 
                              num_workers=args.num_workers, shuffle=False)
     
@@ -213,7 +225,10 @@ def test_on_testset(args):
     ae.load_state_dict(ckpt['ae'])
     
     # 加载MARDM模型
-    cond_mode = 'audio'
+    if args.dataset_name == 'mixed':
+        cond_mode = 'mixed'
+    else:
+        cond_mode = 'audio'
     audio_dim = 512
     ema_mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim)
     checkpoint_path = pjoin(model_dir, 'latest.tar')
@@ -237,9 +252,16 @@ def test_on_testset(args):
     num_samples = min(args.num_test_samples, len(test_dataset))
     
     with torch.no_grad():
-        for idx, (whisper_features, motion_condition, motion_target, m_lens) in enumerate(tqdm(test_loader, desc="Testing batches")):
+        for idx, batch_data in enumerate(tqdm(test_loader, desc="Testing batches")):
             if idx * args.batch_size >= num_samples:
                 break
+            
+            # 处理不同数据集格式
+            if args.dataset_name == 'mixed' or args.dataset_name == 'semi_synthetic':
+                whisper_features, clip_features, motion_condition, motion_target, m_lens = batch_data
+            else:
+                whisper_features, motion_condition, motion_target, m_lens = batch_data
+                clip_features = None
             
             # 移动到设备
             whisper_features = whisper_features.to(device).float()  # [B, 250, 512]
@@ -253,6 +275,17 @@ def test_on_testset(args):
             # Target length in latent space: 60 (for 240 frames)
             m_lens_target = torch.tensor([240 // 4] * whisper_features.size(0), device=device).long()  # [B] = [60]
             
+            # 准备text condition（mixed模式）
+            text_condition_tensor = None
+            if cond_mode == 'mixed':
+                if clip_features is not None:
+                    text_condition_tensor = clip_features.to(device).float()  # [B, 512]
+                else:
+                    # 如果没有提供CLIP特征，使用零向量padding
+                    batch_size = whisper_features.size(0)
+                    clip_feature = np.zeros(512, dtype=np.float32)
+                    text_condition_tensor = torch.from_numpy(clip_feature).unsqueeze(0).expand(batch_size, -1).to(device).float()  # [B, 512]
+            
             # 生成motion（带进度条）
             # whisper_features shape: [B, 250, 512]
             # m_lens_target: [B] - target motion lengths in latent space (240/4 = 60)
@@ -265,7 +298,8 @@ def test_on_testset(args):
                     cond_scale=args.cfg,
                     temperature=args.temperature,
                     progress_callback=lambda step: pbar.update(1),
-                    motion_condition_latent=motion_condition_latent  # [B, ae_dim, 15]
+                    motion_condition_latent=motion_condition_latent,  # [B, ae_dim, 15]
+                    text_condition=text_condition_tensor  # [B, 512] for mixed mode
                 )
             # 解码motion
             # pred_latents shape: [B, ae_dim, 60] where 60 is latent sequence length for 240 frames
@@ -410,7 +444,10 @@ def generate_from_audio_wav(args):
     ae.load_state_dict(ckpt['ae'])
     
     # 加载MARDM模型
-    cond_mode = 'audio'
+    if args.dataset_name == 'mixed' or args.dataset_name == 'semi_synthetic':
+        cond_mode = 'mixed'
+    else:
+        cond_mode = 'audio'
     audio_dim = 512
     ema_mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim)
     checkpoint_path = pjoin(model_dir, 'latest.tar')
@@ -422,6 +459,13 @@ def generate_from_audio_wav(args):
     ema_mardm.to(device)
     ae.eval()
     ema_mardm.eval()
+    
+    # 对于mixed模式，需要准备CLIP特征（从音频生成时使用零向量）
+    clip_feature = None
+    if cond_mode == 'mixed':
+        # 从音频生成时没有text description，使用零向量padding
+        clip_feature = np.zeros(512, dtype=np.float32)  # CLIP feature dimension is 512
+        print("Using zero-padded CLIP feature for audio-only generation (mixed mode)")
     
     # 处理长音频：如果音频长度 > 250帧，分成带重叠的片段
     total_audio_frames = features.shape[0]
@@ -482,6 +526,11 @@ def generate_from_audio_wav(args):
                 prev_condition_motion_tensor = torch.from_numpy(prev_condition_motion).unsqueeze(0).to(device).float()
                 current_condition_latent = ae.encode(prev_condition_motion_tensor)  # [1, ae_dim, 15]
             
+            # 准备text condition（mixed模式）
+            text_condition_tensor = None
+            if cond_mode == 'mixed':
+                text_condition_tensor = torch.from_numpy(clip_feature).unsqueeze(0).to(device).float()  # [1, 512]
+            
             # 生成motion（带进度条）
             with tqdm(total=args.time_steps, desc=f"  Segment {seg_idx+1}/{len(audio_segments)}", leave=False) as pbar:
                 pred_latents = ema_mardm.generate(
@@ -491,7 +540,8 @@ def generate_from_audio_wav(args):
                     cond_scale=args.cfg,
                     temperature=args.temperature,
                     progress_callback=lambda step: pbar.update(step),
-                    motion_condition_latent=current_condition_latent  # [1, ae_dim, 15]
+                    motion_condition_latent=current_condition_latent,  # [1, ae_dim, 15]
+                    text_condition=text_condition_tensor  # [1, 512] for mixed mode
                 )
             
             # 解码motion
@@ -574,7 +624,7 @@ if __name__ == "__main__":
     # 基本参数
     parser.add_argument('--mode', type=str, default='testset', choices=['testset', 'audio'],
                        help='Test mode: "testset" for testing on test set, "audio" for generating from audio wav')
-    parser.add_argument('--name', type=str, default='MARDM_SiT_XL_beat_v2',
+    parser.add_argument('--name', type=str, default='MARDM_SiT_XL_mixed',
                        help='Model name')
     parser.add_argument('--ae_name', type=str, default="AE",
                        help='AE model name')
@@ -582,7 +632,7 @@ if __name__ == "__main__":
                        help='AE model type')
     parser.add_argument('--model', type=str, default='MARDM-SiT-XL',
                        help='MARDM model type')
-    parser.add_argument('--dataset_name', type=str, default='beat_v2',
+    parser.add_argument('--dataset_name', type=str, default='mixed',
                        help='Dataset name')
     parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints',
                        help='Checkpoints directory')

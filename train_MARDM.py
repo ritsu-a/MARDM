@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from models.AE import AE_models
 from models.MARDM import MARDM_models
 from utils.evaluators import Evaluators
-from utils.datasets import Text2MotionDataset, BEAT_v2Audio2MotionDataset, MixedAudioTextDataset, collate_fn
+from utils.datasets import Text2MotionDataset, BEAT_v2Audio2MotionDataset, MixedAudioTextDataset, SemiSyntheticAudioTextDataset, collate_fn
 import time
 import copy
 from collections import OrderedDict, defaultdict
@@ -132,6 +132,36 @@ def main(args):
                                   num_workers=args.num_workers, shuffle=shuffle, pin_memory=True, sampler=train_sampler)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, 
                                 num_workers=args.num_workers, shuffle=False, pin_memory=True, sampler=val_sampler)
+    elif args.dataset_name == "semi_synthetic":
+        # Semi-synthetic dataset only
+        semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
+        
+        # Use BEAT_v2 mean/std (or compute semi-synthetic mean/std if needed)
+        # For now, use BEAT_v2 mean/std for compatibility
+        data_root = '/root/workspace/MARDM/data/BEAT_v2'
+        mean = np.load(pjoin(data_root, 'Mean.npy'))
+        std = np.load(pjoin(data_root, 'Std.npy'))
+        dim_pose = mean.shape[0]
+        
+        train_dataset = SemiSyntheticAudioTextDataset(mean, std, semi_synthetic_root, 
+                                                      args.unit_length, args.max_motion_length, split='train')
+        val_dataset = SemiSyntheticAudioTextDataset(mean, std, semi_synthetic_root, 
+                                                    args.unit_length, args.max_motion_length, split='val')
+        
+        # Setup distributed sampler if using distributed training
+        if args.distributed:
+            train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True)
+            val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False)
+            shuffle = False  # Shuffle is handled by DistributedSampler
+        else:
+            train_sampler = None
+            val_sampler = None
+            shuffle = True
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, 
+                                  num_workers=args.num_workers, shuffle=shuffle, pin_memory=True, sampler=train_sampler)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, 
+                                num_workers=args.num_workers, shuffle=False, pin_memory=True, sampler=val_sampler)
     elif args.dataset_name == "t2m":
         data_root = f'{args.dataset_dir}/HumanML3D/'
         dim_pose = 67
@@ -187,6 +217,12 @@ def main(args):
             eval_dataset = MixedAudioTextDataset(mean, std, beat_v2_root, semi_synthetic_root, 4, 196, split='val')
             eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
                                      shuffle=True)
+        elif args.dataset_name == "semi_synthetic":
+            # For semi-synthetic dataset, use validation dataset for evaluation
+            semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
+            eval_dataset = SemiSyntheticAudioTextDataset(mean, std, semi_synthetic_root, 4, 196, split='val')
+            eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
+                                     shuffle=True)
         else:
             eval_mean = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_mean.npy')
             eval_std = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_std.npy')
@@ -202,7 +238,14 @@ def main(args):
     os.makedirs(model_dir, exist_ok=True)
 
     ae = AE_models[args.ae_model](input_width=dim_pose)
-    ckpt = torch.load(pjoin(args.checkpoints_dir, args.dataset_name, args.ae_name, 'model',
+    # Use 'mixed' AE checkpoint for 'semi_synthetic' dataset if it doesn't exist
+    ae_dataset_name = args.dataset_name
+    if args.dataset_name == "semi_synthetic":
+        # Check if semi_synthetic AE exists, otherwise use mixed
+        semi_synthetic_ae_path = pjoin(args.checkpoints_dir, "semi_synthetic", args.ae_name, 'model', 'latest.tar')
+        if not os.path.exists(semi_synthetic_ae_path):
+            ae_dataset_name = "mixed"
+    ckpt = torch.load(pjoin(args.checkpoints_dir, ae_dataset_name, args.ae_name, 'model',
                             'latest.tar'), map_location='cpu')
     model_key = 'ae'
     ae.load_state_dict(ckpt[model_key])
@@ -215,13 +258,14 @@ def main(args):
         motion_cond_drop_prob = getattr(args, 'motion_cond_drop_prob', 0.3)  # Default 0.5 (50% chance to replace with noise)
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim, 
                                          motion_cond_drop_prob=motion_cond_drop_prob)
-    elif args.dataset_name == "mixed":
+    elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic":
         cond_mode = 'mixed'
         # Whisper base model feature dimension is 512
         audio_dim = 512
         motion_cond_drop_prob = getattr(args, 'motion_cond_drop_prob', 0.3)
+        clip_proj_dim = getattr(args, 'clip_proj_dim', 32)  # Project CLIP feature to 32 dim
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim, 
-                                         motion_cond_drop_prob=motion_cond_drop_prob)
+                                         motion_cond_drop_prob=motion_cond_drop_prob, clip_proj_dim=clip_proj_dim)
     else:
         cond_mode = 'text'
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode)
@@ -334,7 +378,7 @@ def main(args):
                     loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
                 else:
                     loss = mardm.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
-            elif args.dataset_name == "mixed":
+            elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic":
                 whisper_features, clip_features, motion_condition, motion_target, m_lens = batch_data
                 motion_condition = motion_condition.detach().float().to(device)  # [B, 60, dim]
                 motion_target = motion_target.detach().float().to(device)  # [B, 240, dim]
@@ -358,6 +402,20 @@ def main(args):
                     clip_features = torch.from_numpy(clip_features).to(device).float()
                 else:
                     clip_features = clip_features.to(device).float()
+                
+                # Optionally replace CLIP features with noise during training
+                if args.text_clip_noise_prob > 0.0:
+                    # Randomly replace CLIP features with noise
+                    noise_mask = torch.rand(clip_features.shape[0], device=device) < args.text_clip_noise_prob
+                    if noise_mask.any():
+                        # Generate random noise with same shape as CLIP features
+                        noise = torch.randn_like(clip_features[noise_mask])
+                        # Optionally normalize noise to match CLIP feature distribution
+                        if args.text_clip_noise_normalize:
+                            # Normalize noise to have similar norm as original CLIP features
+                            original_norms = clip_features[noise_mask].norm(dim=-1, keepdim=True)
+                            noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8) * original_norms
+                        clip_features[noise_mask] = noise
                 
                 # Audio features for cross-attention, text features for motion condition
                 conds = whisper_features  # Only audio features for cross-attention
@@ -428,7 +486,7 @@ def main(args):
         with torch.no_grad():
             for i, batch_data in enumerate(val_loader):
                 # For beat_v2: (whisper_features, motion_condition, motion_target, m_lens)
-                # For mixed: (whisper_features, clip_feature, motion_condition, motion_target, m_lens)
+                # For mixed/semi_synthetic: (whisper_features, clip_feature, motion_condition, motion_target, m_lens)
                 # For text datasets: (text, motion, m_lens)
                 if args.dataset_name == "beat_v2":
                     conds, motion_condition, motion_target, m_lens = batch_data
@@ -454,7 +512,7 @@ def main(args):
                         loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
                     else:
                         loss = mardm.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
-                elif args.dataset_name == "mixed":
+                elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic":
                     whisper_features, clip_features, motion_condition, motion_target, m_lens = batch_data
                     motion_condition = motion_condition.detach().float().to(device)  # [B, 60, dim]
                     motion_target = motion_target.detach().float().to(device)  # [B, 240, dim]
@@ -479,6 +537,16 @@ def main(args):
                     else:
                         clip_features = clip_features.to(device).float()
                     
+                    # Optionally replace CLIP features with noise during validation (usually disabled)
+                    if args.text_clip_noise_prob > 0.0 and args.text_clip_noise_in_val:
+                        noise_mask = torch.rand(clip_features.shape[0], device=device) < args.text_clip_noise_prob
+                        if noise_mask.any():
+                            noise = torch.randn_like(clip_features[noise_mask])
+                            if args.text_clip_noise_normalize:
+                                original_norms = clip_features[noise_mask].norm(dim=-1, keepdim=True)
+                                noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8) * original_norms
+                            clip_features[noise_mask] = noise
+                    
                     # Audio features for cross-attention, text features for motion condition
                     conds = whisper_features  # Only audio features for cross-attention
                     
@@ -491,19 +559,26 @@ def main(args):
                                                  motion_condition_latent=motion_condition_latent,
                                                  text_condition=clip_features)
                 else:
-                    conds, motion, m_lens = batch_data
-                    motion = motion.detach().float().to(device)
-                    m_lens = m_lens.detach().long().to(device)
+                    # For text datasets (t2m, kit-ml, etc.): (text, motion, m_lens)
+                    try:
+                        conds, motion, m_lens = batch_data
+                        motion = motion.detach().float().to(device)
+                        m_lens = m_lens.detach().long().to(device)
 
-                    latent = ae.encode(motion)
-                    m_lens = m_lens // 4
+                        latent = ae.encode(motion)
+                        m_lens = m_lens // 4
 
-                    conds = conds.to(device).float() if torch.is_tensor(conds) else conds
+                        conds = conds.to(device).float() if torch.is_tensor(conds) else conds
 
-                    if args.distributed:
-                        loss = mardm.module.forward_loss(latent, conds, m_lens)
-                    else:
-                        loss = mardm.forward_loss(latent, conds, m_lens)
+                        if args.distributed:
+                            loss = mardm.module.forward_loss(latent, conds, m_lens)
+                        else:
+                            loss = mardm.forward_loss(latent, conds, m_lens)
+                    except ValueError as e:
+                        # If unpacking fails, it might be a different dataset format
+                        print(f"Error unpacking batch_data in validation loop: {e}")
+                        print(f"Dataset name: {args.dataset_name}, batch_data length: {len(batch_data) if isinstance(batch_data, (list, tuple)) else 'not a list/tuple'}")
+                        raise
                 val_loss.append(loss.item())
 
         if is_main_process:
@@ -561,6 +636,18 @@ if __name__ == "__main__":
     # Motion condition dropout probability (for beat_v2 dataset)
     parser.add_argument('--motion_cond_drop_prob', type=float, default=0.3,
                        help='Probability of replacing motion condition with random noise during training (default: 0.5)')
+    
+    # Text CLIP feature noise injection (for mixed/semi_synthetic datasets)
+    parser.add_argument('--text_clip_noise_prob', type=float, default=0.0,
+                       help='Probability of replacing text CLIP features with random noise during training (default: 0.0, disabled)')
+    parser.add_argument('--text_clip_noise_normalize', action='store_true',
+                       help='Normalize noise to match original CLIP feature norm distribution')
+    parser.add_argument('--text_clip_noise_in_val', action='store_true',
+                       help='Also apply noise injection during validation (default: False, only in training)')
+    
+    # CLIP feature projector dimension
+    parser.add_argument('--clip_proj_dim', type=int, default=32,
+                       help='Dimension to project CLIP features to before processing (default: 32)')
     
     # Distributed training arguments
     parser.add_argument('--distributed', action='store_true', help='Use distributed training')
