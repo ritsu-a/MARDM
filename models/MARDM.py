@@ -279,10 +279,10 @@ class MARDM(nn.Module):
             else:
                 raise ValueError(f"Unexpected audio feature shape: {y_tensor.shape}")
         elif self.cond_mode == 'mixed':
-            # y is a tuple: (audio_features, clip_features)
+            # y is a tuple: (audio_features)
             # audio_features: [batch_size, T_audio, audio_dim] or [batch_size, audio_dim]
             # clip_features: [batch_size, clip_dim] - pre-computed CLIP features (handled separately with motion condition)
-            audio_features, clip_features = y
+            audio_features = y
             
             # Process audio features for cross-attention and adaLN modulation
             audio_tensor = audio_features.to(device).float() if torch.is_tensor(audio_features) else torch.from_numpy(audio_features).to(device).float()
