@@ -45,6 +45,16 @@ class MARDM(nn.Module):
             # Audio sequence embedding for cross-attention
             self.audio_seq_emb = nn.Linear(audio_dim, self.latent_dim)
             self.use_cross_attn = kargs.get('use_cross_attn', True)  # Enable cross-attention by default
+        elif self.cond_mode == 'mixed':
+            # Mixed mode: both audio and text conditions
+            audio_dim = kargs.get('audio_dim', 512)
+            # Text CLIP feature embedding - project to ae_dim to concatenate with motion condition
+            self.text_cond_emb = nn.Linear(self.clip_dim, self.ae_dim)
+            # Audio feature embedding (for adaLN modulation)
+            self.audio_cond_emb = nn.Linear(audio_dim, self.latent_dim)
+            # Audio sequence embedding for cross-attention
+            self.audio_seq_emb = nn.Linear(audio_dim, self.latent_dim)
+            self.use_cross_attn = kargs.get('use_cross_attn', True)  # Enable cross-attention for audio
         elif self.cond_mode == 'action':
             self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
             self.use_cross_attn = False
@@ -73,7 +83,7 @@ class MARDM(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        if self.cond_mode == 'text':
+        if self.cond_mode == 'text' or self.cond_mode == 'mixed':
             print('Loading CLIP...')
             self.clip_version = clip_version
             self.clip_model = self.load_and_freeze_clip(clip_version)
@@ -177,13 +187,14 @@ class MARDM(nn.Module):
                 x = block(x, cond, padding_mask)
         return x
 
-    def forward_loss(self, latents, y, m_lens, motion_condition_latent=None):
+    def forward_loss(self, latents, y, m_lens, motion_condition_latent=None, text_condition=None):
         """
         Args:
             latents: target motion latents [B, ae_dim, L] where L is target length (240 frames in latent space = 60)
             y: audio features [B, T_audio, audio_dim] or other condition
             m_lens: target motion lengths in latent space [B]
             motion_condition_latent: condition motion latents [B, ae_dim, L_cond] where L_cond is condition length (60 frames in latent space = 15)
+            text_condition: text CLIP features [B, clip_dim] - will be concatenated with motion condition
         """
         latents = latents.permute(0, 2, 1)  # [B, ae_dim, L] -> [B, L, ae_dim]
         b, l, d = latents.shape
@@ -193,6 +204,23 @@ class MARDM(nn.Module):
         if motion_condition_latent is not None:
             motion_condition_latent = motion_condition_latent.permute(0, 2, 1)  # [B, ae_dim, L_cond] -> [B, L_cond, ae_dim]
             l_cond = motion_condition_latent.shape[1]
+            
+            # Process text condition and concatenate with motion condition
+            if text_condition is not None and self.cond_mode == 'mixed':
+                # text_condition: [B, clip_dim] -> [B, ae_dim]
+                text_tensor = text_condition.to(device).float() if torch.is_tensor(text_condition) else torch.from_numpy(text_condition).to(device).float()
+                if len(text_tensor.shape) == 1:
+                    text_tensor = text_tensor.unsqueeze(0)
+                if len(text_tensor.shape) == 2 and text_tensor.shape[0] != b:
+                    text_tensor = text_tensor.unsqueeze(0).expand(b, -1)
+                
+                # Project text feature to ae_dim and broadcast to each time step
+                text_feature = self.text_cond_emb(text_tensor)  # [B, ae_dim]
+                text_feature = text_feature.unsqueeze(1).expand(-1, l_cond, -1)  # [B, L_cond, ae_dim]
+                
+                # Concatenate text feature with motion condition (in feature dimension)
+                # Option: add text feature to motion condition
+                motion_condition_latent = motion_condition_latent + text_feature  # [B, L_cond, ae_dim]
             
             if self.training and self.motion_cond_drop_prob > 0.:
                 # Randomly drop/replace motion condition
@@ -250,6 +278,30 @@ class MARDM(nn.Module):
                 audio_mask = None  # TODO: add audio mask if needed
             else:
                 raise ValueError(f"Unexpected audio feature shape: {y_tensor.shape}")
+        elif self.cond_mode == 'mixed':
+            # y is a tuple: (audio_features, clip_features)
+            # audio_features: [batch_size, T_audio, audio_dim] or [batch_size, audio_dim]
+            # clip_features: [batch_size, clip_dim] - pre-computed CLIP features (handled separately with motion condition)
+            audio_features, clip_features = y
+            
+            # Process audio features for cross-attention and adaLN modulation
+            audio_tensor = audio_features.to(device).float() if torch.is_tensor(audio_features) else torch.from_numpy(audio_features).to(device).float()
+            
+            if len(audio_tensor.shape) == 2:
+                # Mean pooled: [batch_size, audio_dim]
+                cond_vector = self.audio_cond_emb(audio_tensor)  # [batch_size, latent_dim]
+                audio_seq = None
+            elif len(audio_tensor.shape) == 3:
+                # Full sequence: [batch_size, T_audio, audio_dim]
+                # Use mean for adaLN modulation, keep sequence for cross-attention
+                cond_vector = self.audio_cond_emb(audio_tensor.mean(dim=1))  # [batch_size, latent_dim]
+                audio_seq = audio_tensor  # [batch_size, T_audio, audio_dim] - will be processed in forward()
+            else:
+                raise ValueError(f"Unexpected audio feature shape: {audio_tensor.shape}")
+            
+            # Text condition is handled separately in motion_condition_latent processing above
+            # Apply masking to audio condition
+            cond_vector = self.mask_cond(cond_vector, force_mask=force_mask)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(y).to(device).float()
         elif self.cond_mode == 'uncond':
@@ -326,7 +378,8 @@ class MARDM(nn.Module):
                  temperature=1,
                  force_mask=False,
                  progress_callback=None,
-                 motion_condition_latent=None
+                 motion_condition_latent=None,
+                 text_condition=None
                  ):
         """
         Args:
@@ -342,6 +395,22 @@ class MARDM(nn.Module):
         if motion_condition_latent is not None:
             motion_condition_latent = motion_condition_latent.permute(0, 2, 1)  # [B, ae_dim, L_cond] -> [B, L_cond, ae_dim]
             l_cond = motion_condition_latent.shape[1]
+            
+            # Process text condition and concatenate with motion condition
+            if text_condition is not None and self.cond_mode == 'mixed':
+                text_tensor = text_condition.to(device).float() if torch.is_tensor(text_condition) else torch.from_numpy(text_condition).to(device).float()
+                if len(text_tensor.shape) == 1:
+                    text_tensor = text_tensor.unsqueeze(0)
+                if len(text_tensor.shape) == 2 and text_tensor.shape[0] != b:
+                    text_tensor = text_tensor.unsqueeze(0).expand(b, -1)
+                
+                # Project text feature to ae_dim and broadcast to each time step
+                text_feature = self.text_cond_emb(text_tensor)  # [B, ae_dim]
+                text_feature = text_feature.unsqueeze(1).expand(-1, l_cond, -1)  # [B, L_cond, ae_dim]
+                
+                # Add text feature to motion condition
+                motion_condition_latent = motion_condition_latent + text_feature  # [B, L_cond, ae_dim]
+            
             l_total = l_cond + l
             m_lens_total = m_lens + l_cond
         else:
@@ -364,6 +433,18 @@ class MARDM(nn.Module):
                 audio_seq = conds_tensor
             else:
                 raise ValueError(f"Unexpected audio feature shape: {conds_tensor.shape}")
+        elif self.cond_mode == 'mixed':
+            # conds is audio_features only (text is handled with motion condition)
+            audio_tensor = conds.to(device).float() if torch.is_tensor(conds) else torch.from_numpy(conds).to(device).float()
+            
+            if len(audio_tensor.shape) == 2:
+                cond_vector = self.audio_cond_emb(audio_tensor)
+                audio_seq = None
+            elif len(audio_tensor.shape) == 3:
+                cond_vector = self.audio_cond_emb(audio_tensor.mean(dim=1))
+                audio_seq = audio_tensor  # Will be processed in forward()
+            else:
+                raise ValueError(f"Unexpected audio feature shape: {audio_tensor.shape}")
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':
@@ -475,6 +556,18 @@ class MARDM(nn.Module):
                 audio_seq = conds_tensor
             else:
                 raise ValueError(f"Unexpected audio feature shape: {conds_tensor.shape}")
+        elif self.cond_mode == 'mixed':
+            # conds is audio_features only (text is handled separately if needed)
+            audio_tensor = conds.to(device).float() if torch.is_tensor(conds) else torch.from_numpy(conds).to(device).float()
+            
+            if len(audio_tensor.shape) == 2:
+                cond_vector = self.audio_cond_emb(audio_tensor)
+                audio_seq = None
+            elif len(audio_tensor.shape) == 3:
+                cond_vector = self.audio_cond_emb(audio_tensor.mean(dim=1))
+                audio_seq = audio_tensor  # Will be processed in forward()
+            else:
+                raise ValueError(f"Unexpected audio feature shape: {audio_tensor.shape}")
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':

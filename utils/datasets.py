@@ -497,6 +497,331 @@ class BEAT_v2Audio2MotionDataset(data.Dataset):
         return whisper_features, motion_condition, motion_target, m_length
 
 
+class MixedAudioTextDataset(data.Dataset):
+    """
+    Mixed dataset combining BEAT_v2 (audio-to-motion) and semi_synthetic_v1_segments (text-to-motion)
+    For BEAT_v2: uses audio (whisper) features, CLIP features are padded with zeros
+    For semi-synthetic: uses text CLIP features, audio features are also available
+    """
+    def __init__(self, mean, std, beat_v2_root, semi_synthetic_root, unit_length, max_motion_length, split='train', train_ratio=0.9):
+        """
+        Mixed Dataset for Audio+Text-to-Motion training (MARDM)
+        Args:
+            mean: mean for normalization
+            std: std for normalization
+            beat_v2_root: root directory of BEAT_v2 data
+            semi_synthetic_root: root directory of semi_synthetic_v1_segments data
+            unit_length: unit length for motion (default 4)
+            max_motion_length: maximum motion length (should be 300)
+            split: 'train' or 'val'
+            train_ratio: ratio of training data
+        """
+        self.mean = mean
+        self.std = std
+        self.unit_length = unit_length
+        self.max_motion_length = max_motion_length  # Should be 300
+        self.clip_dim = 512  # CLIP feature dimension
+        
+        # Frame alignment: same as BEAT_v2Audio2MotionDataset
+        self.target_motion_frames = max_motion_length  # 300 frames total
+        self.condition_motion_frames = 60  # First 60 frames as condition
+        self.target_motion_frames_generate = self.target_motion_frames - self.condition_motion_frames  # 240 frames to generate
+        self.target_audio_frames = int(self.target_motion_frames * 5 / 6)  # 250 for 300 motion frames
+        self.audio_to_motion_ratio = 5.0 / 6.0  # 50/60
+        
+        min_motion_len = self.target_motion_frames
+        max_motion_len = 50000
+        
+        # Collect data from both datasets
+        self.data_dict = {}
+        self.name_list = []
+        self.length_list = []
+        self.dataset_type_list = []  # Track which dataset each sample comes from
+        
+        skipped_no_whisper = 0
+        skipped_length = 0
+        skipped_error = 0
+        
+        # Load BEAT_v2 data
+        beat_v2_npz_files = []
+        if os.path.exists(beat_v2_root):
+            for root, dirs, files in os.walk(beat_v2_root):
+                for file in files:
+                    if file.endswith('.npz') and not file.endswith('_whisper_features.npy'):
+                        beat_v2_npz_files.append(os.path.join(root, file))
+        
+        beat_v2_npz_files.sort()
+        random.seed(42)
+        random.shuffle(beat_v2_npz_files)
+        
+        split_idx = int(len(beat_v2_npz_files) * train_ratio)
+        if split == 'train':
+            beat_v2_npz_files = beat_v2_npz_files[:split_idx]
+        else:
+            beat_v2_npz_files = beat_v2_npz_files[split_idx:]
+        
+        print(f"Loading BEAT_v2 {split} data from {len(beat_v2_npz_files)} files...")
+        
+        # Process BEAT_v2 files (same as BEAT_v2Audio2MotionDataset)
+        for npz_path in tqdm(beat_v2_npz_files, desc="Loading BEAT_v2"):
+            try:
+                motion_data = np.load(npz_path)
+                if 'qpos' in motion_data:
+                    motion = motion_data['qpos']
+                else:
+                    keys = list(motion_data.keys())
+                    if len(keys) > 0:
+                        motion = motion_data[keys[0]]
+                    else:
+                        skipped_error += 1
+                        continue
+                
+                if len(motion.shape) == 1:
+                    motion = motion.reshape(-1, 1)
+                
+                motion_len = motion.shape[0]
+                if motion_len < min_motion_len or motion_len >= max_motion_len:
+                    skipped_length += 1
+                    continue
+                
+                # Find whisper feature file
+                npz_dir = os.path.dirname(npz_path)
+                npz_basename = os.path.basename(npz_path)
+                npz_stem = os.path.splitext(npz_basename)[0]
+                whisper_path = os.path.join(npz_dir, f"{npz_stem}_whisper_features.npy")
+                
+                if not os.path.exists(whisper_path):
+                    skipped_no_whisper += 1
+                    continue
+                
+                try:
+                    whisper_features = np.load(whisper_path)
+                    if len(whisper_features.shape) != 2:
+                        skipped_error += 1
+                        continue
+                except Exception as e:
+                    skipped_error += 1
+                    continue
+                
+                audio_len = whisper_features.shape[0]
+                expected_audio_len = int(motion_len * self.audio_to_motion_ratio)
+                tolerance = 0.05
+                if abs(audio_len - expected_audio_len) / max(expected_audio_len, 1) > tolerance:
+                    skipped_error += 1
+                    continue
+                
+                if motion_len < self.target_motion_frames or audio_len < self.target_audio_frames:
+                    skipped_length += 1
+                    continue
+                
+                # Generate samples
+                num_samples = (motion_len - self.target_motion_frames) // (self.target_motion_frames // 2) + 1
+                num_samples = min(num_samples, 10)
+                
+                for sample_idx in range(num_samples):
+                    if num_samples == 1:
+                        start_motion = 0
+                    else:
+                        max_start = motion_len - self.target_motion_frames
+                        start_motion = int(sample_idx * max_start / (num_samples - 1))
+                    
+                    start_audio = int(start_motion * self.audio_to_motion_ratio)
+                    end_motion = start_motion + self.target_motion_frames
+                    end_audio = start_audio + self.target_audio_frames
+                    
+                    if end_motion > motion_len or end_audio > audio_len:
+                        continue
+                    
+                    motion_segment = motion[start_motion:end_motion]
+                    audio_segment = whisper_features[start_audio:end_audio]
+                    
+                    # Normalize motion
+                    motion_segment = motion_segment[:, :self.mean.shape[0]]
+                    motion_segment = (motion_segment - self.mean) / self.std
+                    
+                    if motion_segment.shape[0] < self.target_motion_frames:
+                        padding = np.zeros((self.target_motion_frames - motion_segment.shape[0], motion_segment.shape[1]))
+                        motion_segment = np.concatenate([motion_segment, padding], axis=0)
+                    
+                    motion_condition = motion_segment[:self.condition_motion_frames]
+                    motion_target = motion_segment[self.condition_motion_frames:]
+                    
+                    # BEAT_v2 has no text description, so CLIP feature is zero-padded
+                    clip_feature = np.zeros(self.clip_dim, dtype=np.float32)
+                    
+                    name = f"beat_v2_{npz_stem}_sample{sample_idx}"
+                    self.data_dict[name] = {
+                        'motion': motion_segment.astype(np.float32),
+                        'motion_condition': motion_condition.astype(np.float32),
+                        'motion_target': motion_target.astype(np.float32),
+                        'whisper': audio_segment.astype(np.float32),
+                        'clip_feature': clip_feature,
+                        'length': self.target_motion_frames,
+                        'dataset_type': 'beat_v2'
+                    }
+                    self.name_list.append(name)
+                    self.length_list.append(self.target_motion_frames)
+                    self.dataset_type_list.append('beat_v2')
+                
+            except Exception as e:
+                skipped_error += 1
+                continue
+        
+        print(f"BEAT_v2: Loaded {sum(1 for dt in self.dataset_type_list if dt == 'beat_v2')} samples")
+        print(f"BEAT_v2 Skipped: {skipped_no_whisper} (no whisper), {skipped_length} (length), {skipped_error} (error)")
+        
+        # Load semi-synthetic data
+        semi_synthetic_npz_files = []
+        if os.path.exists(semi_synthetic_root):
+            for root, dirs, files in os.walk(semi_synthetic_root):
+                for file in files:
+                    if file.endswith('_motion.npz'):
+                        semi_synthetic_npz_files.append(os.path.join(root, file))
+        
+        semi_synthetic_npz_files.sort()
+        random.seed(42)
+        random.shuffle(semi_synthetic_npz_files)
+        
+        split_idx = int(len(semi_synthetic_npz_files) * train_ratio)
+        if split == 'train':
+            semi_synthetic_npz_files = semi_synthetic_npz_files[:split_idx]
+        else:
+            semi_synthetic_npz_files = semi_synthetic_npz_files[split_idx:]
+        
+        print(f"Loading semi-synthetic {split} data from {len(semi_synthetic_npz_files)} files...")
+        
+        skipped_semi = 0
+        
+        for npz_path in tqdm(semi_synthetic_npz_files, desc="Loading semi-synthetic"):
+            try:
+                # Load motion
+                motion_data = np.load(npz_path)
+                if 'qpos' in motion_data:
+                    motion = motion_data['qpos']
+                else:
+                    keys = list(motion_data.keys())
+                    if len(keys) > 0:
+                        motion = motion_data[keys[0]]
+                    else:
+                        skipped_semi += 1
+                        continue
+                
+                if len(motion.shape) == 1:
+                    motion = motion.reshape(-1, 1)
+                
+                motion_len = motion.shape[0]
+                if motion_len < self.target_motion_frames:
+                    skipped_semi += 1
+                    continue
+                
+                # Get base name for finding related files
+                npz_dir = os.path.dirname(npz_path)
+                npz_basename = os.path.basename(npz_path)
+                segment_name = npz_basename.replace('_motion.npz', '')
+                
+                # Load audio features
+                audio_path = os.path.join(npz_dir, f"{segment_name}_audio.npy")
+                if not os.path.exists(audio_path):
+                    skipped_semi += 1
+                    continue
+                
+                try:
+                    audio_features = np.load(audio_path)
+                    if len(audio_features.shape) != 2:
+                        skipped_semi += 1
+                        continue
+                except Exception as e:
+                    skipped_semi += 1
+                    continue
+                
+                # Load CLIP feature (prefer description, fallback to name or semantic)
+                clip_feature = None
+                clip_paths = [
+                    os.path.join(npz_dir, f"{segment_name}_clip_description.npy"),
+                    os.path.join(npz_dir, f"{segment_name}_clip_name.npy"),
+                    os.path.join(npz_dir, f"{segment_name}_clip_semantic.npy")
+                ]
+                
+                for clip_path in clip_paths:
+                    if os.path.exists(clip_path):
+                        try:
+                            clip_feature = np.load(clip_path)
+                            if len(clip_feature.shape) == 1 and clip_feature.shape[0] == self.clip_dim:
+                                break
+                        except Exception as e:
+                            continue
+                
+                if clip_feature is None:
+                    # If no CLIP feature found, use zero padding
+                    clip_feature = np.zeros(self.clip_dim, dtype=np.float32)
+                
+                # Extract fixed-length segments
+                if motion_len >= self.target_motion_frames:
+                    motion_segment = motion[:self.target_motion_frames]
+                else:
+                    padding = np.zeros((self.target_motion_frames - motion_len, motion.shape[1]))
+                    motion_segment = np.concatenate([motion, padding], axis=0)
+                
+                # Normalize motion
+                motion_segment = motion_segment[:, :self.mean.shape[0]]
+                motion_segment = (motion_segment - self.mean) / self.std
+                
+                motion_condition = motion_segment[:self.condition_motion_frames]
+                motion_target = motion_segment[self.condition_motion_frames:]
+                
+                # Process audio features (should be 250 frames)
+                if audio_features.shape[0] >= self.target_audio_frames:
+                    audio_segment = audio_features[:self.target_audio_frames]
+                else:
+                    padding = np.zeros((self.target_audio_frames - audio_features.shape[0], audio_features.shape[1]))
+                    audio_segment = np.concatenate([audio_features, padding], axis=0)
+                
+                name = f"semi_synthetic_{segment_name}"
+                self.data_dict[name] = {
+                    'motion': motion_segment.astype(np.float32),
+                    'motion_condition': motion_condition.astype(np.float32),
+                    'motion_target': motion_target.astype(np.float32),
+                    'whisper': audio_segment.astype(np.float32),
+                    'clip_feature': clip_feature.astype(np.float32),
+                    'length': self.target_motion_frames,
+                    'dataset_type': 'semi_synthetic'
+                }
+                self.name_list.append(name)
+                self.length_list.append(self.target_motion_frames)
+                self.dataset_type_list.append('semi_synthetic')
+                
+            except Exception as e:
+                skipped_semi += 1
+                continue
+        
+        self.length_arr = np.array(self.length_list)
+        print(f"Semi-synthetic: Loaded {sum(1 for dt in self.dataset_type_list if dt == 'semi_synthetic')} samples")
+        print(f"Semi-synthetic Skipped: {skipped_semi} (error/missing)")
+        print(f"Total samples: {len(self.data_dict)} (BEAT_v2: {sum(1 for dt in self.dataset_type_list if dt == 'beat_v2')}, Semi-synthetic: {sum(1 for dt in self.dataset_type_list if dt == 'semi_synthetic')})")
+    
+    def __len__(self):
+        return len(self.data_dict)
+    
+    def __getitem__(self, item):
+        """
+        Returns:
+            whisper_features: [target_audio_frames, feature_dim] - audio features (250 frames)
+            clip_feature: [clip_dim] - CLIP text feature (512 dim)
+            motion_condition: [condition_motion_frames, motion_dim] - first 60 frames as condition
+            motion_target: [target_motion_frames_generate, motion_dim] - last 240 frames as target
+            m_length: int - total motion length (300)
+        """
+        name = self.name_list[item]
+        data = self.data_dict[name]
+        motion_condition = data['motion_condition'].copy()
+        motion_target = data['motion_target'].copy()
+        whisper_features = data['whisper'].copy()
+        clip_feature = data['clip_feature'].copy()
+        m_length = data['length']
+        
+        return whisper_features, clip_feature, motion_condition, motion_target, m_length
+
+
 class Text2MotionDataset(data.Dataset):
     def __init__(self, mean, std, split_file, dataset_name, motion_dir, text_dir, unit_length, max_motion_length,
                  max_text_length, evaluation=False):
