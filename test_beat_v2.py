@@ -287,21 +287,24 @@ def test_on_testset(args):
                     text_condition_tensor = torch.from_numpy(clip_feature).unsqueeze(0).expand(batch_size, -1).to(device).float()  # [B, 512]
             
             # 生成motion（带进度条）
-            # semi_synthetic: 仅用文本，conds 传 clip [B, 512]；mixed: 用 audio，conds 传 whisper_features
+            # semi_synthetic: 仅用 audio，conds=None，audio_condition 传 whisper_features [B, 250, 512]；mixed: 用 audio，conds 传 whisper_features
             if args.dataset_name == 'semi_synthetic':
-                conds_for_gen = (clip_features if torch.is_tensor(clip_features) else torch.from_numpy(clip_features)).to(device).float()
+                conds_for_gen = None
+                audio_condition_for_gen = whisper_features  # [B, 250, 512] -> 下采样到 [B, 25, 512] 后 append
             else:
                 conds_for_gen = whisper_features
+                audio_condition_for_gen = None
             with tqdm(total=args.time_steps, desc=f"  Generating batch {idx+1}", leave=False) as pbar:
                 pred_latents = ema_mardm.generate(
-                    conds=conds_for_gen,  # semi_synthetic: [B, 512] text; mixed: [B, 250, 512] audio
+                    conds=conds_for_gen,  # semi_synthetic: None; mixed: [B, 250, 512] audio
                     m_lens=m_lens_target,  # [B] - latent lengths (60 for 240 frames)
                     timesteps=args.time_steps,
                     cond_scale=args.cfg,
                     temperature=args.temperature,
                     progress_callback=lambda step: pbar.update(1),
                     motion_condition_latent=motion_condition_latent,  # [B, ae_dim, 15]
-                    text_condition=text_condition_tensor  # [B, 512] for mixed mode
+                    text_condition=None,
+                    audio_condition=audio_condition_for_gen  # semi_synthetic: [B, 250, 512]; mixed: None
                 )
             # 解码motion
             # pred_latents shape: [B, ae_dim, 60] where 60 is latent sequence length for 240 frames
