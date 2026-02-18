@@ -109,32 +109,24 @@ Train MARDM on mixed data:
     --max_motion_length 300 \
     --distributed
 
-Train MARDM on semi-synthetic data only:
-    # 只在semi-synthetic数据集上训练 MARDM (8 GPU):
-    torchrun --master_port 29503 --nproc_per_node=8 train_MARDM.py \
-    --name MARDM_DDPM_XL_semi_synthetic_caption \
-    --model "MARDM-DDPM-XL" \
-    --dataset_name semi_synthetic \
-    --batch_size 64 \
-    --ae_name AE \
-    --milestones 20000 \
-    --max_motion_length 300 \
-    --distributed \
-    --epoch 1000
+Train MARDM on semi-synthetic (text prompt only):
+    # 仅在 semi-synthetic 上使用 text prompt 训练：仅文本 + 前60帧 -> 预测后240帧，无 audio、无 cross-attention。
+   
 
-    # 使用text CLIP feature噪声注入进行训练（数据增强）:
+    # 多卡 (例如 8 GPU):
     torchrun --master_port 29503 --nproc_per_node=8 train_MARDM.py \
-    --name MARDM_DDPM_XL_semi_synthetic_noise \
-    --model "MARDM-DDPM-XL" \
-    --dataset_name semi_synthetic \
-    --batch_size 64 \
-    --ae_name AE \
-    --milestones 20000 \
-    --max_motion_length 300 \
-    --text_clip_noise_prob 0.5 \
-    --text_clip_noise_normalize \
-    --distributed \
-    --epoch 1000
+        --name MARDM_SiT_XL_semi_synthetic_text_only \
+        --model "MARDM-SiT-XL" \
+        --dataset_name semi_synthetic \
+        --ae_name AE \
+        --batch_size 32 \
+        --epoch 2000 \
+        --max_motion_length 300 \
+        --milestones 50000 \
+        --lr 2e-4 \
+        --distributed
+
+   
 
 
 

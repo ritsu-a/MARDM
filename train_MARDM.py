@@ -263,9 +263,11 @@ def main(args):
         # Whisper base model feature dimension is 512
         audio_dim = 512
         motion_cond_drop_prob = getattr(args, 'motion_cond_drop_prob', 0.3)
-        clip_proj_dim = getattr(args, 'clip_proj_dim', 32)  # Project CLIP feature to 32 dim
+        # semi_synthetic 仅用文本 + 前60帧预测后240帧，关闭 cross attention，不使用 audio
+        use_cross_attn = (args.dataset_name != "semi_synthetic")
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim, 
-                                         motion_cond_drop_prob=motion_cond_drop_prob, clip_proj_dim=clip_proj_dim)
+                                         motion_cond_drop_prob=motion_cond_drop_prob,
+                                         use_cross_attn=use_cross_attn)
     else:
         cond_mode = 'text'
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode)
@@ -417,8 +419,12 @@ def main(args):
                             noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8) * original_norms
                         clip_features[noise_mask] = noise
                 
-                # Audio features for cross-attention, text features for motion condition
-                conds = whisper_features  # Only audio features for cross-attention
+                # semi_synthetic 仅用文本：不传 audio，传 conds=None，用 text_condition 做 adaLN
+                # mixed 用 audio 做 cross-attention 与 adaLN
+                if args.dataset_name == "semi_synthetic":
+                    conds = None  # 不使用 audio，仅用 text + 前60帧
+                else:
+                    conds = whisper_features
                 
                 if args.distributed:
                     loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, 
@@ -547,8 +553,10 @@ def main(args):
                                 noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8) * original_norms
                             clip_features[noise_mask] = noise
                     
-                    # Audio features for cross-attention, text features for motion condition
-                    conds = whisper_features  # Only audio features for cross-attention
+                    if args.dataset_name == "semi_synthetic":
+                        conds = None
+                    else:
+                        conds = whisper_features
                     
                     if args.distributed:
                         loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, 
