@@ -419,25 +419,21 @@ def main(args):
                             noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8) * original_norms
                         clip_features[noise_mask] = noise
                 
-                # semi_synthetic 仅用 audio：不传 conds，传 conds=None，用 audio_condition 做 append 和 adaLN
+                # semi_synthetic 仅用文本：不传 audio，传 conds=None，用 text_condition 做 adaLN
                 # mixed 用 audio 做 cross-attention 与 adaLN
                 if args.dataset_name == "semi_synthetic":
-                    conds = None  # 不使用 conds，用 audio_condition
-                    audio_condition = whisper_features  # [B, 250, 512] -> 下采样到 [B, 25, 512] 后 append
+                    conds = None  # 不使用 audio，仅用 text + 前60帧
                 else:
                     conds = whisper_features
-                    audio_condition = None
                 
                 if args.distributed:
                     loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, 
                                                      motion_condition_latent=motion_condition_latent,
-                                                     text_condition=None,
-                                                     audio_condition=audio_condition)
+                                                     text_condition=clip_features)
                 else:
                     loss = mardm.forward_loss(motion_target_latent, conds, m_lens_target, 
                                              motion_condition_latent=motion_condition_latent,
-                                             text_condition=None,
-                                             audio_condition=audio_condition)
+                                             text_condition=clip_features)
             else:
                 conds, motion, m_lens = batch_data
                 motion = motion.detach().float().to(device)
@@ -559,21 +555,17 @@ def main(args):
                     
                     if args.dataset_name == "semi_synthetic":
                         conds = None
-                        audio_condition = whisper_features
                     else:
                         conds = whisper_features
-                        audio_condition = None
                     
                     if args.distributed:
                         loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, 
                                                          motion_condition_latent=motion_condition_latent,
-                                                         text_condition=None,
-                                                         audio_condition=audio_condition)
+                                                         text_condition=clip_features)
                     else:
                         loss = mardm.forward_loss(motion_target_latent, conds, m_lens_target, 
                                                  motion_condition_latent=motion_condition_latent,
-                                                 text_condition=None,
-                                                 audio_condition=audio_condition)
+                                                 text_condition=clip_features)
                 else:
                     # For text datasets (t2m, kit-ml, etc.): (text, motion, m_lens)
                     try:
