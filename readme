@@ -5,6 +5,17 @@ Visualization of vanilla MARDM:
 Visualization of source motion:
     python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/semi_synthetic_v1_segments/11995_HAND_SNATCH-4_1_motion.npz
 
+Convert humanml3d pickle to npz format (with fps interpolation from 20fps to 60fps and low-pass filtering):
+
+    # Single file conversion:
+    python utils/convert_humanml3d_to_npz.py --pickle_path /root/workspace/MARDM/data/G1ML3D_v1/joints/000000.pickle --output_path /root/workspace/MARDM/data/G1ML3D_v1/joints_npz/000000.npz --src_fps 20 --tgt_fps 60 --filter_cutoff 2 --filter_order 4
+    
+    # Batch conversion (process entire directory):
+    python utils/convert_humanml3d_to_npz.py --input_dir /root/workspace/MARDM/data/G1ML3D_v1/joints --output_dir /root/workspace/MARDM/data/G1ML3D_v1/joints_npz --src_fps 20 --tgt_fps 60 --filter_cutoff 2 --filter_order 4
+    
+Visualization of converted humanml3d npz data:
+    python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/G1ML3D_v1/joints_npz/000000.npz --motion_fps 60
+
 Visualize VAE comparison (original vs reconstructed):
     python vis_AE_comparison.py --npz_path checkpoints/beat_v2/AE/test_results/sample_0000.npz --output_path videos/ae_comparison.mp4 --robot g1_branco
 
