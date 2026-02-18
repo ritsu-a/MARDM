@@ -220,7 +220,7 @@ def test_on_testset(args):
     # 加载模型
     model_dir = pjoin(args.checkpoints_dir, args.dataset_name, args.name, 'model')
     ae = AE_models[args.ae_model](input_width=dim_pose)
-    ckpt = torch.load(pjoin(args.checkpoints_dir, args.dataset_name, args.ae_name, 'model',
+    ckpt = torch.load(pjoin(args.checkpoints_dir, "mixed", args.ae_name, 'model',
                             'latest.tar'), map_location='cpu')
     ae.load_state_dict(ckpt['ae'])
     
