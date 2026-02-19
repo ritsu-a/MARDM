@@ -1,6 +1,8 @@
 Visualization of vanilla MARDM:
     python sample.py --name MARDM_SiT_XL --text_prompt "A person is waving his left hand."
 
+Visualization of source motion:
+    python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/semi_synthetic_v1_segments/11995_HAND_SNATCH-4_1_motion.npz
 
 
 
