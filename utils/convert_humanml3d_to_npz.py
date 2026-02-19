@@ -247,6 +247,9 @@ def load_humanml3d_pickle(pickle_path):
     Returns:
         qpos: numpy array of shape (N, 60)
         fps: frame rate
+        
+    Raises:
+        ValueError: If the pickle file contains NaN or Inf values
     """
     with open(pickle_path, "rb") as f:
         data = pickle.load(f)
@@ -255,6 +258,14 @@ def load_humanml3d_pickle(pickle_path):
     global_rotation = data["global_rotation"]  # (N, 3, 2) - 6D rotation
     angles = data["angles"]  # (N, 29) for g1_29
     fps = data.get("fps", 20)
+    
+    # Check for NaN or Inf values in input data
+    if np.isnan(global_translation).any() or np.isinf(global_translation).any():
+        raise ValueError(f"NaN or Inf values found in global_translation")
+    if np.isnan(global_rotation).any() or np.isinf(global_rotation).any():
+        raise ValueError(f"NaN or Inf values found in global_rotation")
+    if np.isnan(angles).any() or np.isinf(angles).any():
+        raise ValueError(f"NaN or Inf values found in angles")
     
     quat_xyzw = vec6d_to_quat(global_rotation)
     quat_wxyz = np.zeros_like(quat_xyzw)
@@ -294,6 +305,11 @@ def convert_pickle_to_npz(pickle_path, output_path, src_fps=20, tgt_fps=60, filt
     try:
         qpos, data_fps = load_humanml3d_pickle(pickle_path)
         
+        # Check for NaN/Inf in loaded qpos (shouldn't happen if input is clean, but double-check)
+        if np.isnan(qpos).any() or np.isinf(qpos).any():
+            print(f"Warning: NaN/Inf detected in qpos after loading {pickle_path}, skipping")
+            return False
+        
         # Use fps from data if available, otherwise use src_fps
         if data_fps != src_fps:
             src_fps = data_fps
@@ -301,8 +317,18 @@ def convert_pickle_to_npz(pickle_path, output_path, src_fps=20, tgt_fps=60, filt
         # Interpolate qpos
         qpos_interpolated = interpolate_qpos(qpos, src_fps=src_fps, tgt_fps=tgt_fps)
         
+        # Check for NaN/Inf after interpolation
+        if np.isnan(qpos_interpolated).any() or np.isinf(qpos_interpolated).any():
+            print(f"Warning: NaN/Inf detected after interpolation for {pickle_path}, skipping")
+            return False
+        
         # Apply low-pass filter to reduce jitter
         qpos_filtered = low_pass_filter(qpos_interpolated, cutoff_freq=filter_cutoff, order=filter_order, fps=tgt_fps)
+        
+        # Final check before saving
+        if np.isnan(qpos_filtered).any() or np.isinf(qpos_filtered).any():
+            print(f"Warning: NaN/Inf detected after filtering for {pickle_path}, skipping")
+            return False
         
         # Save as npz
         output_path_obj = pathlib.Path(output_path)
@@ -310,6 +336,10 @@ def convert_pickle_to_npz(pickle_path, output_path, src_fps=20, tgt_fps=60, filt
         np.savez(output_path, qpos=qpos_filtered)
         
         return True
+    except ValueError as e:
+        # ValueError indicates NaN/Inf in input data - skip this file
+        print(f"Skipping {pickle_path}: {e}")
+        return False
     except Exception as e:
         print(f"Error converting {pickle_path}: {e}")
         return False
@@ -342,6 +372,7 @@ def batch_convert_pickle_to_npz(input_dir, output_dir, src_fps=20, tgt_fps=60, f
     
     # Process each file
     success_count = 0
+    skipped_count = 0
     for pickle_file in tqdm(pickle_files, desc="Converting"):
         # Generate output filename
         output_file = output_path / (pickle_file.stem + ".npz")

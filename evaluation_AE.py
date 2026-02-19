@@ -6,7 +6,7 @@ import random
 from torch.utils.data import DataLoader
 from models.AE import AE_models
 from utils.evaluators import Evaluators
-from utils.datasets import Text2MotionDataset, BEAT_v2Dataset, MixedDataset, collate_fn
+from utils.datasets import Text2MotionDataset, BEAT_v2Dataset, MixedDataset, G1ML3D_v1Dataset, collate_fn
 from utils.eval_utils import evaluation_ae
 import warnings
 warnings.filterwarnings('ignore')
@@ -25,7 +25,23 @@ def main(args):
     #################################################################################
     #                                    Eval Data                                  #
     #################################################################################
-    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+    if args.dataset_name == "g1ml3d":
+        # G1ML3D_v1 dataset
+        g1ml3d_root = '/root/workspace/MARDM/data/G1ML3D_v1/joints_npz'
+        
+        mean = np.load(pjoin('/root/workspace/MARDM/data/G1ML3D_v1', 'Mean.npy'))
+        std = np.load(pjoin('/root/workspace/MARDM/data/G1ML3D_v1', 'Std.npy'))
+        dim_pose = mean.shape[0]
+        joints_num = dim_pose
+        
+        eval_dataset = G1ML3D_v1Dataset(mean, std, g1ml3d_root, args.window_size, split='val')
+        
+        eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
+                                shuffle=False, pin_memory=True)
+        
+        eval_wrapper = None  # No text-based evaluation for G1ML3D_v1
+        
+    elif args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
         # Mixed dataset (BEAT_v2 + semi_synthetic_v1_segments) or BEAT_v2 only
         beat_v2_root = '/root/workspace/MARDM/data/BEAT_v2'
         semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
@@ -85,7 +101,7 @@ def main(args):
     model_dir = pjoin(args.checkpoints_dir, args.dataset_name, args.name, 'model')
 
     ae = AE_models[args.model](input_width=dim_pose)
-    checkpoint_path = os.path.join(model_dir, 'latest.tar' if args.dataset_name in ['t2m', 'beat_v2', 'mixed'] else 'net_best_fid.tar')
+    checkpoint_path = os.path.join(model_dir, 'latest.tar' if args.dataset_name in ['t2m', 'beat_v2', 'mixed', 'g1ml3d'] else 'net_best_fid.tar')
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     ae.load_state_dict(checkpoint['ae'])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

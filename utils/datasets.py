@@ -7,6 +7,8 @@ import random
 import codecs as cs
 import os
 import glob
+import torch
+import clip
 from utils.glove import GloVe
 
 #################################################################################
@@ -154,6 +156,117 @@ class BEAT_v2Dataset(data.Dataset):
         
         motion = (motion - mean_subset) / std_subset
         
+        # Clip extreme values to prevent gradient explosion (clip to [-5, 5])
+        motion = np.clip(motion, -5.0, 5.0)
+        
+        # Pad if necessary
+        if motion.shape[1] < self.mean.shape[0]:
+            padding = np.zeros((motion.shape[0], self.mean.shape[0] - motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=1)
+        
+        return motion
+
+
+class G1ML3D_v1Dataset(data.Dataset):
+    def __init__(self, mean, std, data_root, window_size, split='train', train_ratio=0.9):
+        """
+        G1ML3D_v1 Dataset for VAE training
+        Args:
+            mean: mean for normalization
+            std: std for normalization
+            data_root: root directory of G1ML3D_v1 data (e.g., '/root/workspace/MARDM/data/G1ML3D_v1/joints_npz')
+            window_size: window size for training
+            split: 'train' or 'val'
+            train_ratio: ratio of training data
+        """
+        self.data = []
+        self.lengths = []
+        self.window_size = window_size
+        self.mean = mean
+        self.std = std
+        
+        # Find all npz files
+        npz_files = []
+        for root, dirs, files in os.walk(data_root):
+            for file in files:
+                if file.endswith('.npz'):
+                    npz_files.append(os.path.join(root, file))
+        
+        npz_files.sort()  # Ensure consistent ordering
+        random.seed(42)  # Fixed seed for reproducibility
+        random.shuffle(npz_files)
+        
+        # Split train/val
+        split_idx = int(len(npz_files) * train_ratio)
+        if split == 'train':
+            npz_files = npz_files[:split_idx]
+        else:
+            npz_files = npz_files[split_idx:]
+        
+        print(f"Loading {split} data from {len(npz_files)} files...")
+        
+        for npz_path in tqdm(npz_files):
+            try:
+                data = np.load(npz_path)
+                if 'qpos' in data:
+                    motion = data['qpos']
+                else:
+                    # Try to get the first array if qpos doesn't exist
+                    keys = list(data.keys())
+                    if len(keys) > 0:
+                        motion = data[keys[0]]
+                    else:
+                        continue
+                
+                # Check for NaN or Inf values - skip files with invalid data
+                if np.isnan(motion).any() or np.isinf(motion).any():
+                    print(f"Warning: Skipping {npz_path} due to NaN/Inf values")
+                    continue
+                
+                # Ensure motion is 2D
+                if len(motion.shape) == 1:
+                    motion = motion.reshape(-1, 1)
+                
+                if motion.shape[0] < window_size:
+                    continue
+                
+                self.lengths.append(motion.shape[0] - window_size)
+                self.data.append(motion)
+            except Exception as e:
+                print(f"Error loading {npz_path}: {e}")
+                continue
+        
+        self.cumsum = np.cumsum([0] + self.lengths)
+        print("Total number of motions {}, snippets {}".format(len(self.data), self.cumsum[-1]))
+    
+    def __len__(self):
+        return self.cumsum[-1]
+    
+    def __getitem__(self, item):
+        if item != 0:
+            motion_id = np.searchsorted(self.cumsum, item) - 1
+            idx = item - self.cumsum[motion_id] - 1
+        else:
+            motion_id = 0
+            idx = 0
+        
+        motion = self.data[motion_id][idx:idx + self.window_size]
+        
+        # Z Normalization
+        # Handle dimension mismatch
+        min_dim = min(motion.shape[1], self.mean.shape[0])
+        motion = motion[:, :min_dim]
+        mean_subset = self.mean[:min_dim]
+        std_subset = self.std[:min_dim]
+        
+        # Avoid division by zero
+        std_subset = np.where(std_subset < 1e-8, 1.0, std_subset)
+        
+        motion = (motion - mean_subset) / std_subset
+        
+        # Clip extreme values to prevent gradient explosion (clip to [-5, 5])
+        motion = np.clip(motion, -5.0, 5.0)
+        
         # Pad if necessary
         if motion.shape[1] < self.mean.shape[0]:
             padding = np.zeros((motion.shape[0], self.mean.shape[0] - motion.shape[1]))
@@ -272,6 +385,9 @@ class MixedDataset(data.Dataset):
         std_subset = np.where(std_subset < 1e-8, 1.0, std_subset)
         
         motion = (motion - mean_subset) / std_subset
+        
+        # Clip extreme values to prevent gradient explosion (clip to [-5, 5])
+        motion = np.clip(motion, -5.0, 5.0)
         
         # Pad if necessary
         if motion.shape[1] < self.mean.shape[0]:
@@ -1008,6 +1124,190 @@ class SemiSyntheticAudioTextDataset(data.Dataset):
         m_length = data['length']
         
         return whisper_features, clip_feature, motion_condition, motion_target, m_length
+
+
+class G1ML3DText2MotionDataset(data.Dataset):
+    """
+    Dataset for G1ML3D_v1 text-to-motion training (text prompt only)
+    Uses text CLIP features, no audio, no cross-attention
+    Format: 前60帧 -> 预测后240帧
+    """
+    def __init__(self, mean, std, data_root, text_dir, split_file, unit_length, max_motion_length, 
+                 split='train', clip_version='ViT-B/32', device='cpu'):
+        """
+        G1ML3D Dataset for Text-to-Motion training (MARDM)
+        Args:
+            mean: mean for normalization
+            std: std for normalization
+            data_root: root directory of G1ML3D_v1 motion data (e.g., '/root/workspace/MARDM/data/G1ML3D_v1/joints_npz')
+            text_dir: root directory of text files (e.g., '/root/workspace/MARDM/data/G1ML3D_v1/texts')
+            split_file: path to split file (train.txt or val.txt)
+            unit_length: unit length for motion (default 4)
+            max_motion_length: maximum motion length (should be 300)
+            split: 'train' or 'val'
+            clip_version: CLIP model version (default 'ViT-B/32')
+            device: device to load CLIP model on (default 'cpu')
+        """
+        self.mean = mean
+        self.std = std
+        self.unit_length = unit_length
+        self.max_motion_length = max_motion_length  # Should be 300
+        self.clip_dim = 512  # CLIP feature dimension
+        
+        # Frame alignment: 前60帧作为condition，后240帧作为target
+        self.target_motion_frames = max_motion_length  # 300 frames total
+        self.condition_motion_frames = 60  # First 60 frames as condition
+        self.target_motion_frames_generate = self.target_motion_frames - self.condition_motion_frames  # 240 frames to generate
+        
+        # Load CLIP model for text encoding
+        print(f'Loading CLIP model ({clip_version}) for G1ML3D text encoding...')
+        self.clip_model, _ = clip.load(clip_version, device=device, jit=False)
+        self.clip_model.eval()
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+        
+        # Collect data
+        self.data_dict = {}
+        self.name_list = []
+        self.length_list = []
+        
+        skipped_length = 0
+        skipped_error = 0
+        
+        # Read split file
+        id_list = []
+        with cs.open(split_file, 'r') as f:
+            for line in f.readlines():
+                id_list.append(line.strip())
+        
+        print(f"Loading G1ML3D {split} data from {len(id_list)} files...")
+        
+        for name in tqdm(id_list, desc=f"Loading G1ML3D {split}"):
+            try:
+                # Load motion data
+                motion_path = pjoin(data_root, name + '.npz')
+                if not os.path.exists(motion_path):
+                    skipped_error += 1
+                    continue
+                
+                motion_data = np.load(motion_path)
+                if 'qpos' in motion_data:
+                    motion = motion_data['qpos']
+                else:
+                    keys = list(motion_data.keys())
+                    if len(keys) > 0:
+                        motion = motion_data[keys[0]]
+                    else:
+                        skipped_error += 1
+                        continue
+                
+                if len(motion.shape) == 1:
+                    motion = motion.reshape(-1, 1)
+                
+                motion_len = motion.shape[0]
+                if motion_len < self.target_motion_frames:
+                    skipped_length += 1
+                    continue
+                
+                # Load text file
+                text_path = pjoin(text_dir, name + '.txt')
+                if not os.path.exists(text_path):
+                    skipped_error += 1
+                    continue
+                
+                # Read text descriptions
+                text_list = []
+                with cs.open(text_path, 'r') as f:
+                    for line in f.readlines():
+                        line_split = line.strip().split('#')
+                        if len(line_split) >= 1:
+                            caption = line_split[0].strip()
+                            if caption:
+                                text_list.append(caption)
+                
+                if len(text_list) == 0:
+                    skipped_error += 1
+                    continue
+                
+                # Randomly select one caption for this sample
+                selected_caption = random.choice(text_list)
+                
+                # Encode text with CLIP
+                with torch.no_grad():
+                    text_tokens = clip.tokenize([selected_caption], truncate=True).to(device)
+                    text_features = self.clip_model.encode_text(text_tokens)
+                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                    clip_feature = text_features[0].cpu().numpy().astype(np.float32)
+                
+                # Extract fixed-length segments
+                if motion_len >= self.target_motion_frames:
+                    motion_segment = motion[:self.target_motion_frames]
+                else:
+                    padding = np.zeros((self.target_motion_frames - motion_len, motion.shape[1]))
+                    motion_segment = np.concatenate([motion, padding], axis=0)
+                
+                # Normalize motion
+                min_dim = min(motion_segment.shape[1], self.mean.shape[0])
+                motion_segment = motion_segment[:, :min_dim]
+                mean_subset = self.mean[:min_dim]
+                std_subset = self.std[:min_dim]
+                std_subset = np.where(std_subset < 1e-8, 1.0, std_subset)
+                motion_segment = (motion_segment - mean_subset) / std_subset
+                motion_segment = np.clip(motion_segment, -5.0, 5.0)
+                
+                # Pad if necessary
+                if motion_segment.shape[1] < self.mean.shape[0]:
+                    padding = np.zeros((motion_segment.shape[0], self.mean.shape[0] - motion_segment.shape[1]))
+                    motion_segment = np.concatenate([motion_segment, padding], axis=1)
+                
+                motion_condition = motion_segment[:self.condition_motion_frames]
+                motion_target = motion_segment[self.condition_motion_frames:]
+                
+                # Store data (no audio, so whisper_features is None or zero-padded)
+                self.data_dict[name] = {
+                    'motion': motion_segment.astype(np.float32),
+                    'motion_condition': motion_condition.astype(np.float32),
+                    'motion_target': motion_target.astype(np.float32),
+                    'clip_feature': clip_feature,
+                    'length': self.target_motion_frames
+                }
+                self.name_list.append(name)
+                self.length_list.append(self.target_motion_frames)
+                
+            except Exception as e:
+                skipped_error += 1
+                if skipped_error <= 5:
+                    print(f"Error loading {name}: {e}")
+                continue
+        
+        self.length_arr = np.array(self.length_list)
+        print(f"G1ML3D {split}: Loaded {len(self.data_dict)} samples")
+        print(f"G1ML3D {split} Skipped: {skipped_length} (length), {skipped_error} (error)")
+    
+    def __len__(self):
+        return len(self.data_dict)
+    
+    def __getitem__(self, item):
+        """
+        Returns:
+            whisper_features: None (text-only mode, no audio)
+            clip_feature: [clip_dim] - CLIP text feature (512 dim)
+            motion_condition: [condition_motion_frames, motion_dim] - first 60 frames as condition
+            motion_target: [target_motion_frames_generate, motion_dim] - last 240 frames as target
+            m_length: int - total motion length (300)
+        """
+        name = self.name_list[item]
+        data = self.data_dict[name]
+        motion_condition = data['motion_condition'].copy()
+        motion_target = data['motion_target'].copy()
+        clip_feature = data['clip_feature'].copy()
+        m_length = data['length']
+        
+        # Return zero-padded array for whisper_features (text-only mode, no audio)
+        # Shape: [target_audio_frames, feature_dim] = [250, 512] to match other datasets
+        # But since we don't use it, we can return a dummy array
+        dummy_whisper = np.zeros((250, 512), dtype=np.float32)
+        return dummy_whisper, clip_feature, motion_condition, motion_target, m_length
 
 
 class Text2MotionDataset(data.Dataset):

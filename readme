@@ -27,9 +27,9 @@ Preprocess whisper feature of semi_synthetic_v1:
     python utils/batch_whisper_features.py --input_dir /root/workspace/MARDM/data/semi_synthetic_v1 --num_gpus 8 --num_workers 4
     
 
-Compute mean and std of BEAT_v2 and semi_synthetic_v1_segments:
+Compute mean and std of BEAT_v2, semi_synthetic_v1_segments, and G1ML3D_v1:
     python utils/cal_mean_std.py
-    Note: This will calculate mean and std for both BEAT_v2 and semi_synthetic_v1_segments datasets.
+    Note: This will calculate mean and std for BEAT_v2, semi_synthetic_v1_segments, and G1ML3D_v1 datasets.
           Results will be saved to their respective data directories (Mean.npy and Std.npy).
 
 Train VAE on mixed dataset (BEAT_v2 + semi_synthetic_v1_segments) (8 GPUs):
@@ -43,6 +43,30 @@ Train VAE on mixed dataset (BEAT_v2 + semi_synthetic_v1_segments) (single GPU):
 
 Evaluate VAE on mixed dataset (BEAT_v2 + semi_synthetic_v1_segments):
     python evaluation_AE.py --name AE --dataset_name mixed --model AE_Model --batch_size 256 --window_size 180
+
+Train VAE on G1ML3D_v1 dataset (8 GPUs):
+    torchrun --nproc_per_node=8 --master_port=29501 train_AE.py --name AE --dataset_name g1ml3d --batch_size 256 --epoch 50 --lr_decay 0.05 --distributed
+    Note: batch_size is per GPU, so total batch size = 256 * 8 = 2048
+
+Train VAE on G1ML3D_v1 dataset (single GPU):
+    python train_AE.py --name AE --dataset_name g1ml3d --batch_size 256 --epoch 50 --lr_decay 0.05
+
+Evaluate VAE on G1ML3D_v1 dataset:
+    python evaluation_AE.py --name AE --dataset_name g1ml3d --model AE_Model --batch_size 256 --window_size 180
+
+Test VAE on G1ML3D_v1 dataset and generate comparison videos:
+    python test_AE_g1ml3d.py \
+        --name AE \
+        --model AE_Model \
+        --dataset_name g1ml3d \
+        --window_size 180 \
+        --num_samples_per_dataset 10 \
+        --sample_strategy diverse \
+        --generate_videos \
+        --num_video_samples 10 \
+        --robot_type g1_brainco \
+        --motion_fps 60 \
+        --rate_limit
 
 Test VAE on mixed dataset and generate comparison videos with audio:
     python test_AE_mixed.py \
@@ -136,6 +160,31 @@ Train MARDM on semi-synthetic (text prompt only):
         --milestones 50000 \
         --lr 2e-4 \
         --distributed
+
+Train MARDM on G1ML3D_v1 (text prompt only):
+    # 在 G1ML3D_v1 上使用 text prompt 训练：仅文本 + 前60帧 -> 预测后240帧，无 audio、无 cross-attention。
+   
+
+    # 多卡 (例如 8 GPU):
+    torchrun --master_port 29504 --nproc_per_node=8 train_MARDM.py \
+        --name MARDM_SiT_XL_g1ml3d_text_only \
+        --model "MARDM-SiT-XL" \
+        --dataset_name g1ml3d \
+        --ae_name AE \
+        --batch_size 32 \
+        --epoch 2000 \
+        --max_motion_length 300 \
+        --milestones 50000 \
+        --lr 2e-4 \
+        --distributed
+
+Test MARDM on G1ML3D_v1 (text2motion):
+    # 1. 在验证集上评测（预测 + 真值 npz，可选生成对比视频）:
+    python test_g1ml3d.py --mode testset --name MARDM_SiT_XL_g1ml3d_text_only --num_test_samples 100 --batch_size 16
+    python test_g1ml3d.py --mode testset --name MARDM_SiT_XL_g1ml3d_text_only --num_test_samples 20 --generate_videos --robot_type g1_brainco --motion_fps 60
+
+    # 2. 从文本描述生成动作（前60帧为零姿态条件，生成后240帧）:
+    python test_g1ml3d.py --mode text --name MARDM_SiT_XL_g1ml3d_text_only --text_prompt "A person is waving his left hand." --generate_videos --robot_type g1_brainco --motion_fps 60
 
    
 

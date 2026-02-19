@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 from models.AE import AE_models
 from utils.evaluators import Evaluators
-from utils.datasets import AEDataset, Text2MotionDataset, BEAT_v2Dataset, MixedDataset, collate_fn
+from utils.datasets import AEDataset, Text2MotionDataset, BEAT_v2Dataset, MixedDataset, G1ML3D_v1Dataset, collate_fn
 import time
 from collections import OrderedDict, defaultdict
 from utils.train_utils import update_lr_warm_up, def_value, save, print_current_loss
@@ -71,7 +71,38 @@ def main(args):
     #################################################################################
     #                                    Train Data                                 #
     #################################################################################
-    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+    if args.dataset_name == "g1ml3d":
+        # G1ML3D_v1 dataset
+        g1ml3d_root = '/root/workspace/MARDM/data/G1ML3D_v1/joints_npz'
+        
+        # Load pre-computed mean and std
+        mean_path = pjoin('/root/workspace/MARDM/data/G1ML3D_v1', 'Mean.npy')
+        std_path = pjoin('/root/workspace/MARDM/data/G1ML3D_v1', 'Std.npy')
+        
+        if os.path.exists(mean_path) and os.path.exists(std_path):
+            mean = np.load(mean_path)
+            std = np.load(std_path)
+            print(f"Loaded mean and std from {mean_path} and {std_path}")
+            print(f"Mean shape: {mean.shape}, Std shape: {std.shape}")
+        else:
+            raise FileNotFoundError(
+                f"Mean and std files not found for G1ML3D_v1 dataset.\n"
+                f"Please run: python utils/cal_mean_std.py\n"
+                f"Expected files: {mean_path} and {std_path}"
+            )
+        
+        dim_pose = mean.shape[0]
+        joints_num = dim_pose
+        
+        train_dataset = G1ML3D_v1Dataset(mean, std, g1ml3d_root, args.window_size, split='train')
+        val_dataset = G1ML3D_v1Dataset(mean, std, g1ml3d_root, args.window_size, split='val')
+        
+        # For evaluation, we still need Text2MotionDataset but it won't be used
+        max_motion_length = 180
+        eval_mean = mean
+        eval_std = std
+        
+    elif args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
         # Mixed dataset (BEAT_v2 + semi_synthetic_v1_segments)
         beat_v2_root = '/root/workspace/MARDM/data/BEAT_v2'
         semi_synthetic_root = '/root/workspace/MARDM/data/semi_synthetic_v1_segments'
@@ -160,8 +191,8 @@ def main(args):
     #################################################################################
     #                                    Eval Data                                  #
     #################################################################################
-    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
-        # For BEAT_v2/mixed, we skip the text-based evaluation dataset
+    if args.dataset_name == "beat_v2" or args.dataset_name == "mixed" or args.dataset_name == "g1ml3d":
+        # For BEAT_v2/mixed/g1ml3d, we skip the text-based evaluation dataset
         eval_loader = None
         eval_wrapper = None
     else:
@@ -194,7 +225,7 @@ def main(args):
     else:
         ae_model = ae
     
-    if args.dataset_name not in ["beat_v2", "mixed"]:
+    if args.dataset_name not in ["beat_v2", "mixed", "g1ml3d"]:
         eval_wrapper = Evaluators(args.dataset_name, device=device)
     else:
         eval_wrapper = None
@@ -255,9 +286,9 @@ def main(args):
 
             loss_rec = criterion(pred_motion, motions)
             
-            # For BEAT_v2/mixed, we use a simpler loss (only reconstruction)
+            # For BEAT_v2/mixed/g1ml3d, we use a simpler loss (only reconstruction)
             # For other datasets, we use the original joint-based loss
-            if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+            if args.dataset_name == "beat_v2" or args.dataset_name == "mixed" or args.dataset_name == "g1ml3d":
                 loss = loss_rec
                 loss_explicit = torch.tensor(0.0)
             else:
@@ -266,8 +297,21 @@ def main(args):
                 loss_explicit = criterion(pred_local_pos, local_pos)
                 loss = loss_rec + args.aux_loss_joints * loss_explicit
 
+            # Check for NaN loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                if is_main_process:
+                    print(f"Warning: NaN/Inf loss detected at iteration {it}, skipping this batch")
+                    print(f"  loss_rec: {loss_rec.item()}, pred_motion range: [{pred_motion.min().item():.4f}, {pred_motion.max().item():.4f}]")
+                    print(f"  motions range: [{motions.min().item():.4f}, {motions.max().item():.4f}]")
+                optimizer.zero_grad()
+                continue
+            
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(ae_model.parameters(), max_norm=1.0)
+            
             optimizer.step()
 
             if it >= args.warm_up_iter:
@@ -310,8 +354,15 @@ def main(args):
 
                 loss_rec = criterion(pred_motion, motions)
                 
-                # For BEAT_v2/mixed, we use a simpler loss (only reconstruction)
-                if args.dataset_name == "beat_v2" or args.dataset_name == "mixed":
+                # Check for NaN in predictions
+                if torch.isnan(pred_motion).any() or torch.isinf(pred_motion).any():
+                    if is_main_process:
+                        print(f"Warning: NaN/Inf in model output at iteration {it}")
+                    optimizer.zero_grad()
+                    continue
+                
+                # For BEAT_v2/mixed/g1ml3d, we use a simpler loss (only reconstruction)
+                if args.dataset_name == "beat_v2" or args.dataset_name == "mixed" or args.dataset_name == "g1ml3d":
                     loss = loss_rec
                     loss_explicit = torch.tensor(0.0)
                 else:
@@ -332,7 +383,7 @@ def main(args):
             print('Validation Loss: %.5f, Reconstruction: %.5f, Velocity: %.5f,' %
                   (sum(val_loss) / len(val_loss), sum(val_loss_rec) / len(val_loss), sum(val_loss_vel) / len(val_loss)))
 
-        if args.dataset_name not in ["beat_v2", "mixed"] and eval_loader is not None and is_main_process:
+        if args.dataset_name not in ["beat_v2", "mixed", "g1ml3d"] and eval_loader is not None and is_main_process:
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, mpjpe, writer = evaluation_ae(
                 model_dir, eval_loader, ae_model, logger, epoch-1, device=device, num_joint=joints_num, best_fid=best_fid,
                 best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,

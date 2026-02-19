@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from models.AE import AE_models
 from models.MARDM import MARDM_models
 from utils.evaluators import Evaluators
-from utils.datasets import Text2MotionDataset, BEAT_v2Audio2MotionDataset, MixedAudioTextDataset, SemiSyntheticAudioTextDataset, collate_fn
+from utils.datasets import Text2MotionDataset, BEAT_v2Audio2MotionDataset, MixedAudioTextDataset, SemiSyntheticAudioTextDataset, G1ML3DText2MotionDataset, collate_fn
 import time
 import copy
 from collections import OrderedDict, defaultdict
@@ -162,6 +162,43 @@ def main(args):
                                   num_workers=args.num_workers, shuffle=shuffle, pin_memory=True, sampler=train_sampler)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, 
                                 num_workers=args.num_workers, shuffle=False, pin_memory=True, sampler=val_sampler)
+    elif args.dataset_name == "g1ml3d":
+        # G1ML3D_v1 dataset (text-to-motion only)
+        g1ml3d_root = '/root/workspace/MARDM/data/G1ML3D_v1/joints_npz'
+        text_dir = '/root/workspace/MARDM/data/G1ML3D_v1/texts'
+        data_root = '/root/workspace/MARDM/data/G1ML3D_v1'
+        
+        mean = np.load(pjoin(data_root, 'Mean.npy'))
+        std = np.load(pjoin(data_root, 'Std.npy'))
+        dim_pose = mean.shape[0]
+        
+        train_split_file = pjoin(data_root, 'train.txt')
+        val_split_file = pjoin(data_root, 'val.txt')
+        
+        # Determine device for CLIP model
+        device = torch.device(f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu")
+        
+        train_dataset = G1ML3DText2MotionDataset(mean, std, g1ml3d_root, text_dir, train_split_file,
+                                                   args.unit_length, args.max_motion_length, split='train',
+                                                   clip_version='ViT-B/32', device=device)
+        val_dataset = G1ML3DText2MotionDataset(mean, std, g1ml3d_root, text_dir, val_split_file,
+                                                args.unit_length, args.max_motion_length, split='val',
+                                                clip_version='ViT-B/32', device=device)
+        
+        # Setup distributed sampler if using distributed training
+        if args.distributed:
+            train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True)
+            val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=False)
+            shuffle = False  # Shuffle is handled by DistributedSampler
+        else:
+            train_sampler = None
+            val_sampler = None
+            shuffle = True
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, 
+                                  num_workers=args.num_workers, shuffle=shuffle, pin_memory=True, sampler=train_sampler)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=True, 
+                                num_workers=args.num_workers, shuffle=False, pin_memory=True, sampler=val_sampler)
     elif args.dataset_name == "t2m":
         data_root = f'{args.dataset_dir}/HumanML3D/'
         dim_pose = 67
@@ -223,6 +260,16 @@ def main(args):
             eval_dataset = SemiSyntheticAudioTextDataset(mean, std, semi_synthetic_root, 4, 196, split='val')
             eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
                                      shuffle=True)
+        elif args.dataset_name == "g1ml3d":
+            # For g1ml3d dataset, use validation dataset for evaluation
+            g1ml3d_root = '/root/workspace/MARDM/data/G1ML3D_v1/joints_npz'
+            text_dir = '/root/workspace/MARDM/data/G1ML3D_v1/texts'
+            val_split_file = pjoin('/root/workspace/MARDM/data/G1ML3D_v1', 'val.txt')
+            device = torch.device(f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu")
+            eval_dataset = G1ML3DText2MotionDataset(mean, std, g1ml3d_root, text_dir, val_split_file, 4, 196, 
+                                                     split='val', clip_version='ViT-B/32', device=device)
+            eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
+                                     shuffle=True)
         else:
             eval_mean = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_mean.npy')
             eval_std = np.load(f'utils/eval_mean_std/{args.dataset_name}/eval_std.npy')
@@ -238,13 +285,16 @@ def main(args):
     os.makedirs(model_dir, exist_ok=True)
 
     ae = AE_models[args.ae_model](input_width=dim_pose)
-    # Use 'mixed' AE checkpoint for 'semi_synthetic' dataset if it doesn't exist
+    # Use appropriate AE checkpoint
     ae_dataset_name = args.dataset_name
     if args.dataset_name == "semi_synthetic":
         # Check if semi_synthetic AE exists, otherwise use mixed
         semi_synthetic_ae_path = pjoin(args.checkpoints_dir, "semi_synthetic", args.ae_name, 'model', 'latest.tar')
         if not os.path.exists(semi_synthetic_ae_path):
             ae_dataset_name = "mixed"
+    elif args.dataset_name == "g1ml3d":
+        # Use g1ml3d AE checkpoint
+        ae_dataset_name = "g1ml3d"
     ckpt = torch.load(pjoin(args.checkpoints_dir, ae_dataset_name, args.ae_name, 'model',
                             'latest.tar'), map_location='cpu')
     model_key = 'ae'
@@ -258,13 +308,13 @@ def main(args):
         motion_cond_drop_prob = getattr(args, 'motion_cond_drop_prob', 0.3)  # Default 0.5 (50% chance to replace with noise)
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim, 
                                          motion_cond_drop_prob=motion_cond_drop_prob)
-    elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic":
+    elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic" or args.dataset_name == "g1ml3d":
         cond_mode = 'mixed'
         # Whisper base model feature dimension is 512
         audio_dim = 512
         motion_cond_drop_prob = getattr(args, 'motion_cond_drop_prob', 0.3)
-        # semi_synthetic 仅用文本 + 前60帧预测后240帧，关闭 cross attention，不使用 audio
-        use_cross_attn = (args.dataset_name != "semi_synthetic")
+        # semi_synthetic 和 g1ml3d 仅用文本 + 前60帧预测后240帧，关闭 cross attention，不使用 audio
+        use_cross_attn = (args.dataset_name not in ["semi_synthetic", "g1ml3d"])
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim, 
                                          motion_cond_drop_prob=motion_cond_drop_prob,
                                          use_cross_attn=use_cross_attn)
@@ -380,7 +430,7 @@ def main(args):
                     loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
                 else:
                     loss = mardm.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
-            elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic":
+            elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic" or args.dataset_name == "g1ml3d":
                 whisper_features, clip_features, motion_condition, motion_target, m_lens = batch_data
                 motion_condition = motion_condition.detach().float().to(device)  # [B, 60, dim]
                 motion_target = motion_target.detach().float().to(device)  # [B, 240, dim]
@@ -394,6 +444,7 @@ def main(args):
                 m_lens_target = torch.tensor([motion_target.shape[1] // 4] * motion_target.shape[0], device=device).long()
                 
                 # Process audio features (for cross-attention)
+                # For g1ml3d and semi_synthetic, whisper_features is a dummy zero array, but we still process it
                 if isinstance(whisper_features, np.ndarray):
                     whisper_features = torch.from_numpy(whisper_features).to(device).float()
                 else:
@@ -419,9 +470,9 @@ def main(args):
                             noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8) * original_norms
                         clip_features[noise_mask] = noise
                 
-                # semi_synthetic 仅用文本：不传 audio，传 conds=None，用 text_condition 做 adaLN
+                # semi_synthetic 和 g1ml3d 仅用文本：不传 audio，传 conds=None，用 text_condition 做 adaLN
                 # mixed 用 audio 做 cross-attention 与 adaLN
-                if args.dataset_name == "semi_synthetic":
+                if args.dataset_name in ["semi_synthetic", "g1ml3d"]:
                     conds = None  # 不使用 audio，仅用 text + 前60帧
                 else:
                     conds = whisper_features
@@ -518,7 +569,7 @@ def main(args):
                         loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
                     else:
                         loss = mardm.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
-                elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic":
+                elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic" or args.dataset_name == "g1ml3d":
                     whisper_features, clip_features, motion_condition, motion_target, m_lens = batch_data
                     motion_condition = motion_condition.detach().float().to(device)  # [B, 60, dim]
                     motion_target = motion_target.detach().float().to(device)  # [B, 240, dim]
@@ -532,6 +583,7 @@ def main(args):
                     m_lens_target = torch.tensor([motion_target.shape[1] // 4] * motion_target.shape[0], device=device).long()
                     
                     # Process audio features (for cross-attention)
+                    # For g1ml3d and semi_synthetic, whisper_features is a dummy zero array, but we still process it
                     if isinstance(whisper_features, np.ndarray):
                         whisper_features = torch.from_numpy(whisper_features).to(device).float()
                     else:
@@ -553,7 +605,7 @@ def main(args):
                                 noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8) * original_norms
                             clip_features[noise_mask] = noise
                     
-                    if args.dataset_name == "semi_synthetic":
+                    if args.dataset_name in ["semi_synthetic", "g1ml3d"]:
                         conds = None
                     else:
                         conds = whisper_features
