@@ -1,8 +1,48 @@
-Visualization of vanilla MARDM:
-    python sample.py --name MARDM_SiT_XL --text_prompt "A person is waving his left hand."
+Visualization of converted humanml3d npz data:
+    python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/G1ML3D_v1/joints_npz/000000.npz --motion_fps 60
 
-Visualization of source motion:
-    python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/semi_synthetic_v1_segments/11995_HAND_SNATCH-4_1_motion.npz
+Train G1ML3D vae:
+    python train_AE_g1ml3d.py \
+        --dataset_dir ./data/G1ML3D_v1 \
+        --name AE_g1ml3d \
+        --batch_size 256 \
+        --window_size 64 \
+        --epoch 10 \
+        --lr 2e-4 \
+        --checkpoints_dir ./checkpoints
 
+Test G1ML3D vae:
+    python evaluation_AE_g1ml3d.py \
+    --dataset_dir ./data/G1ML3D_v1 \
+    --name AE_g1ml3d \
+    --split_file val.txt \
+    --checkpoint_name latest.tar \
+    --checkpoints_dir ./checkpoints \
+    --num_vis_samples 5 \
+    --vis_robot g1_brainco \
+    --motion_fps 60
 
+Train G1ML3D MARDM (DDPM):
+    python train_MARDM_g1ml3d.py \
+        --dataset_dir ./data/G1ML3D_v1 \
+        --name MARDM_g1ml3d \
+        --ae_name AE_g1ml3d \
+        --ae_checkpoint_name latest.tar \
+        --batch_size 128 \
+        --max_motion_length 196 \
+        --epoch 3000 \
+        --lr 2e-4 \
+        --checkpoints_dir ./checkpoints
 
+Test G1ML3D MARDM (DDPM), e.g. checkpoint_epoch_600:
+    python evaluation_MARDM_g1ml3d.py \
+        --dataset_dir ./data/G1ML3D_v1 \
+        --name MARDM_g1ml3d \
+        --ae_name AE_g1ml3d \
+        --split_file val.txt \
+        --checkpoint_name checkpoint_epoch_3000.tar \
+        --checkpoints_dir ./checkpoints \
+        --num_vis_samples 5 \
+        --vis_robot g1_brainco \
+        --motion_fps 60
+    # Or use full path: --checkpoint_name /root/workspace/MARDM/checkpoints/g1ml3d/MARDM_g1ml3d/model/checkpoint_epoch_600.tar
