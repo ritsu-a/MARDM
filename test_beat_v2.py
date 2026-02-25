@@ -230,7 +230,8 @@ def test_on_testset(args):
     else:
         cond_mode = 'audio'
     audio_dim = 512
-    ema_mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim)
+    ema_mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim,
+                                         use_audio_prefix_cond=getattr(args, 'use_audio_prefix_cond', False))
     checkpoint_path = pjoin(model_dir, 'latest.tar')
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     ema_mardm.load_state_dict(checkpoint['ema_mardm'], strict=False)
@@ -451,7 +452,8 @@ def generate_from_audio_wav(args):
     else:
         cond_mode = 'audio'
     audio_dim = 512
-    ema_mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim)
+    ema_mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim,
+                                         use_audio_prefix_cond=getattr(args, 'use_audio_prefix_cond', False))
     checkpoint_path = pjoin(model_dir, 'latest.tar')
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     ema_mardm.load_state_dict(checkpoint['ema_mardm'], strict=False)
@@ -661,7 +663,12 @@ if __name__ == "__main__":
                        choices=['cuda', 'cpu'],
                        help='Device for whisper feature extraction')
     
-    # 生成参数
+    # 生成参数（audio feature 使用方式需与训练时一致）
+    parser.add_argument('--audio_feature_mode', type=str, default='cross_attention',
+                       choices=['cross_attention', 'prefix'],
+                       help='How to use audio features: cross_attention (default) or prefix. Must match training.')
+    parser.add_argument('--use_audio_prefix_cond', action='store_true',
+                       help='Use audio as prefix cond (deprecated: use --audio_feature_mode prefix instead).')
     parser.add_argument('--time_steps', type=int, default=18,
                        help='Number of diffusion timesteps')
     parser.add_argument('--cfg', type=float, default=4.5,
@@ -680,6 +687,8 @@ if __name__ == "__main__":
                        help='Motion FPS for visualization')
     
     args = parser.parse_args()
+    # 与训练一致的 audio 使用方式：cross_attention（默认）或 prefix
+    args.use_audio_prefix_cond = args.use_audio_prefix_cond or (args.audio_feature_mode == 'prefix')
     
     # 验证参数
     if args.mode == 'audio' and not args.audio_path:

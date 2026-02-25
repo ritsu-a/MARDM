@@ -304,8 +304,10 @@ def main(args):
         # Whisper base model feature dimension is 512
         audio_dim = 512
         motion_cond_drop_prob = getattr(args, 'motion_cond_drop_prob', 0.3)  # Default 0.5 (50% chance to replace with noise)
+        use_audio_prefix_cond = (getattr(args, 'audio_feature_mode', 'cross_attention') == 'prefix')
         mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, audio_dim=audio_dim, 
-                                         motion_cond_drop_prob=motion_cond_drop_prob)
+                                         motion_cond_drop_prob=motion_cond_drop_prob,
+                                         use_audio_prefix_cond=use_audio_prefix_cond)
     elif args.dataset_name == "mixed" or args.dataset_name == "semi_synthetic" or args.dataset_name == "g1ml3d":
         cond_mode = 'mixed'
         # Whisper base model feature dimension is 512
@@ -717,6 +719,11 @@ if __name__ == "__main__":
     # CLIP feature projector dimension
     parser.add_argument('--clip_proj_dim', type=int, default=32,
                        help='Dimension to project CLIP features to before processing (default: 32)')
+    
+    # Audio feature usage: cross_attention (default) or prefix (downsample 10x and prepend before motion)
+    parser.add_argument('--audio_feature_mode', type=str, default='cross_attention',
+                       choices=['cross_attention', 'prefix'],
+                       help='How to use audio features: cross_attention (default) or prefix (concat before motion)')
     
     # Distributed training arguments
     parser.add_argument('--distributed', action='store_true', help='Use distributed training')

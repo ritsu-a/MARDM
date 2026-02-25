@@ -42,9 +42,17 @@ class MARDM(nn.Module):
             # For audio (whisper features), feature dimension is typically 512 for base model
             audio_dim = kargs.get('audio_dim', 512)
             self.cond_emb = nn.Linear(audio_dim, self.latent_dim)
-            # Audio sequence embedding for cross-attention
-            self.audio_seq_emb = nn.Linear(audio_dim, self.latent_dim)
-            self.use_cross_attn = kargs.get('use_cross_attn', True)  # Enable cross-attention by default
+            # use_audio_prefix_cond: downsample audio 10x and concat as cond before motion (no cross-attention)
+            self.use_audio_prefix_cond = kargs.get('use_audio_prefix_cond', False)
+            if self.use_audio_prefix_cond:
+                self.use_cross_attn = False
+                self.audio_downsample_factor = 10
+                self.audio_prefix_emb = nn.Linear(audio_dim, self.ae_dim)  # project to ae_dim to concat with motion
+            else:
+                self.audio_prefix_emb = None
+                self.audio_downsample_factor = 10
+                self.audio_seq_emb = nn.Linear(audio_dim, self.latent_dim)
+                self.use_cross_attn = kargs.get('use_cross_attn', True)  # Enable cross-attention by default
         elif self.cond_mode == 'mixed':
             # Mixed mode: both audio and text conditions (or text-only when use_cross_attn=False)
             audio_dim = kargs.get('audio_dim', 512)
@@ -258,6 +266,22 @@ class MARDM(nn.Module):
             m_lens_total = m_lens
             l_cond = 0
 
+        # Audio as prefix cond: downsample audio 10x and prepend before motion (no cross-attention)
+        l_audio_prefix = 0
+        if self.cond_mode == 'audio' and self.use_audio_prefix_cond and y is not None:
+            y_tensor = y.to(device).float() if torch.is_tensor(y) else torch.from_numpy(y).to(device).float()
+            if len(y_tensor.shape) == 3:
+                T_audio = y_tensor.size(1)
+                T_down = T_audio // self.audio_downsample_factor
+                if T_down > 0:
+                    y_trunc = y_tensor[:, :T_down * self.audio_downsample_factor, :]  # [B, T_down*10, audio_dim]
+                    audio_down = y_trunc.reshape(b, T_down, self.audio_downsample_factor, -1).mean(dim=2)  # [B, T_down, audio_dim]
+                    audio_prefix = self.audio_prefix_emb(audio_down)  # [B, T_down, ae_dim]
+                    latents = torch.cat([audio_prefix, latents], dim=1)  # [B, T_down + l_total, ae_dim]
+                    l_audio_prefix = T_down
+                    l_total = l_audio_prefix + l_total
+                    m_lens_total = l_audio_prefix + m_lens_total  # [B]: per-sample valid length
+
         non_pad_mask = lengths_to_mask(m_lens_total, l_total)
         latents = torch.where(non_pad_mask.unsqueeze(-1), latents, torch.zeros_like(latents))
 
@@ -274,7 +298,7 @@ class MARDM(nn.Module):
         elif self.cond_mode == 'audio':
             # y can be either:
             # - [batch_size, audio_dim] - mean pooled (for backward compatibility)
-            # - [batch_size, T_audio, audio_dim] - full sequence (for cross-attention)
+            # - [batch_size, T_audio, audio_dim] - full sequence (cross-attention or prefix cond)
             y_tensor = y.to(device).float() if torch.is_tensor(y) else torch.from_numpy(y).to(device).float()
             
             if len(y_tensor.shape) == 2:
@@ -282,10 +306,11 @@ class MARDM(nn.Module):
                 cond_vector = self.cond_emb(y_tensor)
             elif len(y_tensor.shape) == 3:
                 # Full sequence: [batch_size, T_audio, audio_dim]
-                # Use mean for adaLN modulation, keep sequence for cross-attention
+                # Use mean for adaLN modulation
                 cond_vector = self.cond_emb(y_tensor.mean(dim=1))  # [batch_size, latent_dim]
-                audio_seq = y_tensor  # [batch_size, T_audio, audio_dim]
-                # Create audio mask (assuming no padding for now, can be extended)
+                # Only pass sequence for cross-attention (not when using audio as prefix cond)
+                if not self.use_audio_prefix_cond:
+                    audio_seq = y_tensor  # [batch_size, T_audio, audio_dim]
                 audio_mask = None  # TODO: add audio mask if needed
             else:
                 raise ValueError(f"Unexpected audio feature shape: {y_tensor.shape}")
@@ -326,16 +351,15 @@ class MARDM(nn.Module):
 
         rand_time = uniform((b,), device=device)
         rand_mask_probs = cosine_schedule(rand_time)
-        # Only mask target frames (after condition), not condition frames
+        # Only mask target frames (after condition and optional audio prefix), not condition frames
         num_masked = (l * rand_mask_probs).round().clamp(min=1)  # Mask only target length
-        batch_randperm = torch.rand((b, l_total), device=device).argsort(dim=-1)
-        # Create mask only for target positions (skip condition frames)
-        mask = batch_randperm < num_masked.unsqueeze(-1)
-        # Shift mask to target positions (skip first l_cond frames)
-        if l_cond > 0:
-            # Only mask positions >= l_cond (target region)
+        l_target = l  # target length (last l positions)
+        batch_randperm = torch.rand((b, l_target), device=device).argsort(dim=-1)
+        mask = batch_randperm < num_masked.unsqueeze(-1)  # [B, l_target]
+        # Shift mask to target positions (skip first l_audio_prefix + l_cond frames)
+        if l_audio_prefix > 0 or l_cond > 0:
             mask_full = torch.zeros((b, l_total), device=device, dtype=torch.bool)
-            mask_full[:, l_cond:] = mask[:, :l]  # Place mask in target region
+            mask_full[:, l_audio_prefix + l_cond:] = mask  # Place mask in target region
             mask = mask_full
         mask &= non_pad_mask
         mask_rlatents = get_mask_subset_prob(mask, 0.1)
@@ -437,6 +461,8 @@ class MARDM(nn.Module):
 
         audio_seq = None
         audio_mask = None
+        l_audio_prefix = 0
+        audio_prefix_tensor = None  # for prepending when use_audio_prefix_cond
         
         if self.cond_mode == 'text':
             with torch.no_grad():
@@ -447,7 +473,16 @@ class MARDM(nn.Module):
                 cond_vector = self.cond_emb(conds_tensor)
             elif len(conds_tensor.shape) == 3:
                 cond_vector = self.cond_emb(conds_tensor.mean(dim=1))
-                audio_seq = conds_tensor
+                if self.use_audio_prefix_cond:
+                    T_audio = conds_tensor.size(1)
+                    T_down = T_audio // self.audio_downsample_factor
+                    if T_down > 0:
+                        y_trunc = conds_tensor[:, :T_down * self.audio_downsample_factor, :]
+                        audio_down = y_trunc.reshape(b, T_down, self.audio_downsample_factor, -1).mean(dim=2)
+                        audio_prefix_tensor = self.audio_prefix_emb(audio_down)  # [B, T_down, ae_dim]
+                        l_audio_prefix = T_down
+                else:
+                    audio_seq = conds_tensor
             else:
                 raise ValueError(f"Unexpected audio feature shape: {conds_tensor.shape}")
         elif self.cond_mode == 'mixed':
@@ -483,13 +518,18 @@ class MARDM(nn.Module):
         else:
             raise NotImplementedError("Unsupported condition mode!!!")
 
+        # Prepend audio prefix to sequence length when use_audio_prefix_cond
+        if l_audio_prefix > 0 and audio_prefix_tensor is not None:
+            l_total = l_audio_prefix + l_total
+            m_lens_total = l_audio_prefix + m_lens_total
+
         padding_mask = ~lengths_to_mask(m_lens_total, l_total)
 
-        # Initialize latents: condition frames (if provided) + masked target frames
+        # Initialize latents: [optional audio prefix] + condition frames (if provided) + masked target frames
         if motion_condition_latent is not None:
             # Condition frames are fixed, target frames start as masked
             target_latents = torch.where(
-                padding_mask[:, l_cond:].unsqueeze(-1), 
+                padding_mask[:, l_cond:].unsqueeze(-1) if l_audio_prefix == 0 else padding_mask[:, l_audio_prefix + l_cond:].unsqueeze(-1), 
                 torch.zeros(b, l, self.ae_dim).to(device),
                 self.mask_latent.repeat(b, l, 1)
             )
@@ -500,17 +540,20 @@ class MARDM(nn.Module):
                 torch.zeros(b, l, self.ae_dim).to(device),
                 self.mask_latent.repeat(b, l, 1)
             )
+        if l_audio_prefix > 0 and audio_prefix_tensor is not None:
+            latents = torch.cat([audio_prefix_tensor, latents], dim=1)  # [B, l_audio_prefix + ..., ae_dim]
         
-        # Create masked_rand_schedule only for target frames (skip condition frames)
-        if motion_condition_latent is not None:
+        # Create masked_rand_schedule only for target frames (skip audio prefix and condition frames)
+        skip_len = l_audio_prefix + l_cond
+        if skip_len > 0:
             masked_rand_schedule = torch.where(
-                padding_mask[:, l_cond:], 
+                padding_mask[:, skip_len:], 
                 1e5, 
-                torch.rand_like(padding_mask[:, l_cond:], dtype=torch.float)
+                torch.rand_like(padding_mask[:, skip_len:], dtype=torch.float)
             )
-            # Pad with 1e5 for condition frames (never mask them)
+            # Pad with 1e5 for audio prefix + condition frames (never mask them)
             masked_rand_schedule = torch.cat([
-                torch.ones(b, l_cond, device=device, dtype=torch.float) * 1e5,
+                torch.ones(b, skip_len, device=device, dtype=torch.float) * 1e5,
                 masked_rand_schedule
             ], dim=1)
         else:
@@ -527,10 +570,9 @@ class MARDM(nn.Module):
             num_masked = torch.round(rand_mask_prob * m_lens).clamp(min=1)  # Mask only target length
             sorted_indices = masked_rand_schedule.argsort(dim=1)
             ranks = sorted_indices.argsort(dim=1)
-            # Create mask only for target positions (skip condition frames)
-            if motion_condition_latent is not None:
-                # Only mask positions >= l_cond (target region)
-                is_mask = (ranks < (num_masked + l_cond).unsqueeze(-1)) & (ranks >= l_cond)
+            # Create mask only for target positions (skip audio prefix and condition frames)
+            if skip_len > 0:
+                is_mask = (ranks < (num_masked + skip_len).unsqueeze(-1)) & (ranks >= skip_len)
             else:
                 is_mask = (ranks < num_masked.unsqueeze(-1))
 
@@ -548,9 +590,10 @@ class MARDM(nn.Module):
 
         latents = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(latents), latents)
         
-        # Return only target latents (skip condition frames)
-        if motion_condition_latent is not None:
-            target_latents = latents[:, l_cond:, :]  # [B, L, ae_dim]
+        # Return only target latents (skip audio prefix and condition frames)
+        skip_len = l_audio_prefix + l_cond
+        if skip_len > 0:
+            target_latents = latents[:, skip_len:, :]  # [B, L, ae_dim]
             return target_latents.permute(0, 2, 1)  # [B, ae_dim, L]
         else:
             return latents.permute(0, 2, 1)

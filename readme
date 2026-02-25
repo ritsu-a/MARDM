@@ -90,16 +90,27 @@ Test VAE on mixed dataset and generate comparison videos with audio:
 
 Train MARDM:
    
-    # For audio-to-motion dataset (beat_v2) - 8 GPU training:
-    torchrun --master_port 29505 --nproc_per_node=8 train_MARDM.py --name MARDM_DDPM_XL_beat_v2_4fps --model "MARDM-DDPM-XL" --dataset_name beat_v2 --batch_size 64 --ae_name AE --epoch 2000 --milestones 20000 --max_motion_length 300 --save_every_epochs 500 --distributed 
+    # 通过 --audio_feature_mode 选择 audio 使用方式，默认 cross_attention；可选 prefix（audio 下采样 10 倍后拼在 motion 前，关闭 cross-attention）。
+    # For audio-to-motion dataset (beat_v2) - 8 GPU training.
+    # 默认 cross_attention:
+    torchrun --master_port 29504 --nproc_per_node=8 train_MARDM.py --name MARDM_DDPM_XL_beat_v2_4fps --model "MARDM-DDPM-XL" --dataset_name beat_v2 --batch_size 64 --ae_name AE --epoch 2000 --milestones 20000 --max_motion_length 300 --save_every_epochs 500 --distributed
+
+    # 使用 prefix 方式（--audio_feature_mode prefix）:
+    torchrun --master_port 29504 --nproc_per_node=8 train_MARDM.py --name MARDM_DDPM_XL_beat_v2_4fps_prefix --model "MARDM-DDPM-XL" --dataset_name beat_v2 --batch_size 64 --ae_name AE --epoch 2000 --milestones 20000 --max_motion_length 300 --save_every_epochs 500 --audio_feature_mode prefix --distributed
 
 Test MARDM (beat_v2):
-   
-    # 1. 在test set上展示效果:
+   # 测试时 --audio_feature_mode 需与训练一致。默认 cross_attention；若用 prefix 训练的 checkpoint 请加 --audio_feature_mode prefix。
+    # 1. 在test set上展示效果（默认 cross_attention）:
     python test_beat_v2.py --mode testset --name MARDM_SiT_XL_beat_v2 --model "MARDM-SiT-XL" --dataset_name beat_v2 --ae_name AE --num_test_samples 100 --batch_size 16
 
-    # 2. 从给定的audio wav文件生成motion并渲染成视频:
+    # 若 checkpoint 为 prefix 方式训练，则加 --audio_feature_mode prefix:
+    python test_beat_v2.py --mode testset --name MARDM_SiT_XL_beat_v2_prefix --model "MARDM-SiT-XL" --dataset_name beat_v2 --ae_name AE --num_test_samples 100 --batch_size 16 --audio_feature_mode prefix
+
+    # 2. 从给定的audio wav文件生成motion并渲染成视频（默认 cross_attention）:
     python test_beat_v2.py --mode audio --name MARDM_SiT_XL_beat_v2 --model "MARDM-SiT-XL" --dataset_name beat_v2 --ae_name AE --audio_path /root/workspace/MARDM/data/BEAT_v2/1/1_wayne_0_2_2.wav --whisper_model base
+
+    # 若为 prefix 方式训练的模型:
+    python test_beat_v2.py --mode audio --name MARDM_SiT_XL_beat_v2_prefix --model "MARDM-SiT-XL" --dataset_name beat_v2 --ae_name AE --audio_path /root/workspace/MARDM/data/BEAT_v2/1/1_wayne_0_2_2.wav --whisper_model base --audio_feature_mode prefix
 
 Test MARDM (mixed):
    
