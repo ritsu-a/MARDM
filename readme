@@ -46,3 +46,29 @@ Test G1ML3D MARDM (DDPM), e.g. checkpoint_epoch_600:
         --vis_robot g1_brainco \
         --motion_fps 60
     # Or use full path: --checkpoint_name /root/workspace/MARDM/checkpoints/g1ml3d/MARDM_g1ml3d/model/checkpoint_epoch_600.tar
+
+
+生成 train/val/test 划分（适用于新数据集如 BEAT_v2，需先有 joints_npz 与可选 texts）:
+    python scripts/split_train_test.py --dataset_dir ./data/BEAT_v2
+    # 仅 train+test、无 val:  --no_val
+    # 自定义比例:  --train_ratio 0.85 --test_ratio 0.15
+
+BEAT_v2 先切片、再分 split（300 帧 motion + 250 帧 whisper，50:60）:
+    python scripts/beat_segment_to_npz.py --dataset_dir ./data/BEAT_v2 --id_list train.txt test.txt --train_ratio 0.8 --seed 42
+    # 先对全部 id 切段，再打乱后按 train_ratio 划分为 train/test
+    # 输出: ① 每段单独 segment/{id}.npz  ② segment_train.npz / segment_test.npz、segment_train.txt / segment_test.txt
+
+
+
+测试 VAE 时直接读 BEAT 切好的 segment（优先 segment_test.npz），checkpoint 用 mixed：
+python evaluation_AE_g1ml3d.py \
+    --dataset_type beat --use_segment \
+    --dataset_dir ./data/BEAT_v2 \
+    --name AE_mixed \
+    --model_dir ./checkpoints/mixed/AE/model \
+    --split_file segment_test.txt \
+    --checkpoint_name latest.tar \
+    --checkpoints_dir ./checkpoints \
+    --num_vis_samples 5 \
+    --vis_robot g1_brainco \
+    --motion_fps 60

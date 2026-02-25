@@ -37,7 +37,7 @@ class AE(nn.Module):
 #                                      AE Zoos                                  #
 #################################################################################
 def ae(**kwargs):
-    return AE(output_emb_width=512, down_t=4, stride_t=2, width=512, depth=3,
+    return AE(output_emb_width=1024, down_t=4, stride_t=2, width=1024, depth=3,
                  dilation_growth_rate=3, activation='relu', norm=None, **kwargs)
 
 AE_models = {

@@ -6,7 +6,7 @@ import random
 from torch.utils.data import DataLoader
 from models.AE import AE_models
 from utils.evaluators import Evaluators
-from utils.datasets import G1ML3DText2MotionDataset, collate_fn
+from utils.datasets import G1ML3DText2MotionDataset, BeatV2Text2MotionDataset, BeatSegmentDataset, collate_fn
 from utils.eval_utils import evaluation_ae
 import warnings
 warnings.filterwarnings('ignore')
@@ -89,11 +89,15 @@ def main(args):
     #################################################################################
     #                                    Eval Data                                  #
     #################################################################################
-    # G1ML3D dataset configuration
     data_root = args.dataset_dir
-    motion_dir = pjoin(data_root, 'joints_npz')
-    text_dir = pjoin(data_root, 'texts')
     max_motion_length = args.max_motion_length
+    use_beat = getattr(args, 'dataset_type', 'g1ml3d') == 'beat'
+    if use_beat:
+        motion_dir = data_root  # BEAT_v2: 运动在 data_root/{id}.npz，id 如 1/1_wayne_0_100_100
+        text_dir = data_root
+    else:
+        motion_dir = pjoin(data_root, 'joints_npz')
+        text_dir = pjoin(data_root, 'texts')
     
     # Load mean and std
     mean_path = pjoin(data_root, 'Mean.npy')
@@ -109,18 +113,53 @@ def main(args):
     eval_mean = mean
     eval_std = std
     
-    split_file = pjoin(data_root, args.split_file)
-    if not os.path.exists(split_file):
-        raise FileNotFoundError(f"Split file not found: {split_file}")
-    
-    eval_dataset = G1ML3DText2MotionDataset(eval_mean, eval_std, split_file, 'g1ml3d', motion_dir, text_dir,
-                                          4, max_motion_length, 20, evaluation=True)
+    use_segment = use_beat and getattr(args, 'use_segment', False)
+    if use_segment:
+        segment_dir = pjoin(data_root, 'segment')
+        segment_split_name = os.path.basename(args.split_file) if 'segment_' in args.split_file else 'segment_test.txt'
+        segment_split = pjoin(segment_dir, segment_split_name)
+        segment_base = os.path.splitext(segment_split_name)[0]
+        merged_npz = pjoin(segment_dir, segment_base + '.npz')
+        if not os.path.exists(segment_split) and not os.path.exists(merged_npz):
+            raise FileNotFoundError(
+                f"Segment split not found: {segment_split} 或 {merged_npz}\n"
+                f"请先运行 scripts/beat_segment_to_npz.py 生成 segment 目录及 segment_test.npz / segment_test.txt"
+            )
+        split_file = segment_split
+    else:
+        if os.path.isabs(args.split_file) and os.path.exists(args.split_file):
+            split_file = args.split_file
+        else:
+            split_file = pjoin(data_root, args.split_file)
+        if not os.path.exists(split_file):
+            fallback = pjoin(data_root, 'test.txt') if 'val' in args.split_file else pjoin(data_root, 'val.txt')
+            if os.path.exists(fallback):
+                split_file = fallback
+                print(f"Using split file: {split_file}")
+            else:
+                raise FileNotFoundError(
+                    f"Split file not found: {split_file}\n"
+                    f"请在数据集目录下放置 val.txt 或 test.txt，每行一个样本 id（与 motion/text 文件名对应）。"
+                )
+
+    if use_beat:
+        if use_segment:
+            eval_dataset = BeatSegmentDataset(segment_dir, segment_split, eval_mean, eval_std,
+                                              max_motion_length, 20, evaluation=True)
+        else:
+            eval_dataset = BeatV2Text2MotionDataset(eval_mean, eval_std, split_file, data_root,
+                                                    4, max_motion_length, 20, evaluation=True)
+    else:
+        eval_dataset = G1ML3DText2MotionDataset(eval_mean, eval_std, split_file, 'g1ml3d', motion_dir, text_dir,
+                                              4, max_motion_length, 20, evaluation=True)
+    if len(eval_dataset) == 0:
+        raise RuntimeError("Eval dataset is empty. Check dataset_dir, split_file, and motion/text paths (BEAT_v2: use --dataset_type beat).")
     eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
                             collate_fn=collate_fn, shuffle=True)
     #################################################################################
     #                                      Models                                   #
     #################################################################################
-    model_dir = pjoin(args.checkpoints_dir, 'g1ml3d', args.name, 'model')
+    model_dir = getattr(args, 'model_dir', None) or pjoin(args.checkpoints_dir, 'g1ml3d', args.name, 'model')
 
     # Get motion dimension from mean shape
     dim_pose = mean.shape[0]
@@ -188,7 +227,11 @@ def main(args):
                     for batch_idx, batch in enumerate(eval_loader):
                         if sample_count >= args.num_vis_samples:
                             break
-                        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = batch
+                        if len(batch) == 8:
+                            word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token, whisper_feat = batch
+                        else:
+                            word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = batch
+                            whisper_feat = None
                         motion = motion.to(device)
                         pred_motion = ae(motion)
                         
@@ -227,7 +270,11 @@ def main(args):
             total_samples = 0
             with torch.no_grad():
                 for batch_idx, batch in enumerate(eval_loader):
-                    word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = batch
+                    if len(batch) == 8:
+                        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token, whisper_feat = batch
+                    else:
+                        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = batch
+                        whisper_feat = None
                     motion = motion.to(device)
                     pred_motion = ae(motion)
                     
@@ -379,12 +426,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', type=str, default='AE')
     parser.add_argument('--model', type=str, default='AE_Model')
+    parser.add_argument('--dataset_type', type=str, default='g1ml3d', choices=('g1ml3d', 'beat'),
+                        help='g1ml3d: joints_npz+texts 平铺；beat: BEAT_v2 嵌套目录+_whisper_features.txt')
+    parser.add_argument('--use_segment', action='store_true',
+                        help='BEAT 时从 dataset_dir/segment 读切好的片段（segment_test.npz 或 segment_test.txt）')
     parser.add_argument('--dataset_dir', type=str, default='./data/G1ML3D_v1',
                         help='Root directory of G1ML3D dataset')
     parser.add_argument('--split_file', type=str, default='test.txt',
                         help='Split file name (test.txt, val.txt, etc.)')
     parser.add_argument('--max_motion_length', type=int, default=196,
                         help='Maximum motion length for evaluation')
+    parser.add_argument('--model_dir', type=str, default=None,
+                        help='AE 模型目录，默认 checkpoints_dir/g1ml3d/name/model；mixed 可用 ./checkpoints/mixed/ae/model')
     parser.add_argument('--checkpoint_name', type=str, default='latest.tar',
                         help='Checkpoint file name (latest.tar or net_best_fid.tar)')
     parser.add_argument('--joints_num', type=int, default=22,
