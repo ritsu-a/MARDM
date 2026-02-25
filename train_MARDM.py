@@ -287,11 +287,9 @@ def main(args):
     ae = AE_models[args.ae_model](input_width=dim_pose)
     # Use appropriate AE checkpoint
     ae_dataset_name = args.dataset_name
-    if args.dataset_name == "semi_synthetic":
+    if args.dataset_name == "semi_synthetic" or args.dataset_name == "beat_v2":
         # Check if semi_synthetic AE exists, otherwise use mixed
-        semi_synthetic_ae_path = pjoin(args.checkpoints_dir, "semi_synthetic", args.ae_name, 'model', 'latest.tar')
-        if not os.path.exists(semi_synthetic_ae_path):
-            ae_dataset_name = "mixed"
+        ae_dataset_name = "mixed"
     elif args.dataset_name == "g1ml3d":
         # Use g1ml3d AE checkpoint
         ae_dataset_name = "g1ml3d"
@@ -424,7 +422,7 @@ def main(args):
                     conds = torch.from_numpy(conds).to(device).float()
                 else:
                     conds = conds.to(device).float()
-                # Shape: [batch_size, 250, feature_dim]
+                # Shape: [batch_size, 250, feature_dim]，与 motion 的 B 已在上方保证一致
                 
                 if args.distributed:
                     loss = mardm.module.forward_loss(motion_target_latent, conds, m_lens_target, motion_condition_latent=motion_condition_latent)
@@ -528,6 +526,16 @@ def main(args):
             else:
                 save(pjoin(model_dir, 'latest.tar'), epoch, mardm, optimizer, scheduler,
                      it, 'mardm', ema_mardm=ema_mardm)
+            # 每隔 save_every_epochs 个 epoch 额外保存一次（epoch 为当前已完成的 epoch，0-indexed）
+            if args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
+                ckpt_name = f'epoch_{epoch + 1}.tar'
+                if args.distributed:
+                    save(pjoin(model_dir, ckpt_name), epoch, mardm.module, optimizer, scheduler,
+                         it, 'mardm', ema_mardm=ema_mardm)
+                else:
+                    save(pjoin(model_dir, ckpt_name), epoch, mardm, optimizer, scheduler,
+                         it, 'mardm', ema_mardm=ema_mardm)
+                print(f'Saved checkpoint: {ckpt_name}')
         epoch += 1
         #################################################################################
         #                                      Eval Loop                                #
@@ -678,6 +686,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=64, type=int)
 
     parser.add_argument('--epoch', default=500, type=int)
+    parser.add_argument('--save_every_epochs', default=0, type=int, help='Save checkpoint every N epochs (0 to disable)')
     parser.add_argument('--warm_up_iter', default=2000, type=int)
     parser.add_argument('--lr', default=2e-4, type=float)
     parser.add_argument('--milestones', default=[50_000], nargs="+", type=int)

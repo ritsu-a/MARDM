@@ -39,10 +39,10 @@ Train VAE on mixed dataset (BEAT_v2 + semi_synthetic_v1_segments) (8 GPUs):
     Note: Mixed dataset combines BEAT_v2 and semi_synthetic_v1_segments datasets for training.
 
 Train VAE on mixed dataset (BEAT_v2 + semi_synthetic_v1_segments) (single GPU):
-    python train_AE.py --name AE --dataset_name mixed --batch_size 256 --epoch 50 --lr_decay 0.05
+    python train_AE.py --name AE --dataset_name mixed --batch_size 2048 --epoch 10 --lr_decay 0.05
 
 Evaluate VAE on mixed dataset (BEAT_v2 + semi_synthetic_v1_segments):
-    python evaluation_AE.py --name AE --dataset_name mixed --model AE_Model --batch_size 256 --window_size 180
+    python evaluation_AE.py --name AE --dataset_name mixed --model AE_Model --batch_size 256 --window_size 176
 
 Train VAE on G1ML3D_v1 dataset (8 GPUs):
     torchrun --nproc_per_node=8 --master_port=29501 train_AE.py --name AE --dataset_name g1ml3d --batch_size 256 --epoch 50 --lr_decay 0.05 --distributed
@@ -73,7 +73,7 @@ Test VAE on mixed dataset and generate comparison videos with audio:
         --name AE \
         --model AE_Model \
         --batch_size 256 \
-        --window_size 300 \
+        --window_size 320 \
         --num_samples_per_dataset 10 \
         --sample_strategy diverse \
         --generate_videos \
@@ -91,7 +91,7 @@ Test VAE on mixed dataset and generate comparison videos with audio:
 Train MARDM:
    
     # For audio-to-motion dataset (beat_v2) - 8 GPU training:
-    torchrun --master_port 29503 --nproc_per_node=8 train_MARDM.py --name MARDM_SiT_XL_beat_v2 --model "MARDM-SiT-XL" --dataset_name beat_v2 --batch_size 16 --ae_name AE --milestones 20000 --max_motion_length 300 --distributed 
+    torchrun --master_port 29505 --nproc_per_node=8 train_MARDM.py --name MARDM_DDPM_XL_beat_v2_4fps --model "MARDM-DDPM-XL" --dataset_name beat_v2 --batch_size 64 --ae_name AE --epoch 2000 --milestones 20000 --max_motion_length 300 --save_every_epochs 500 --distributed 
 
 Test MARDM (beat_v2):
    

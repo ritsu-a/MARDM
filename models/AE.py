@@ -5,7 +5,7 @@ import torch.nn as nn
 #                                         AE                                    #
 #################################################################################
 class AE(nn.Module):
-    def __init__(self, input_width=67, output_emb_width=512, down_t=2, stride_t=2, width=512, depth=3,
+    def __init__(self, input_width=67, output_emb_width=1024, down_t=4, stride_t=2, width=1024, depth=3,
                  dilation_growth_rate=3, activation='relu', norm=None):
         super().__init__()
         self.output_emb_width = output_emb_width
@@ -37,7 +37,7 @@ class AE(nn.Module):
 #                                      AE Zoos                                  #
 #################################################################################
 def ae(**kwargs):
-    return AE(output_emb_width=512, down_t=2, stride_t=2, width=512, depth=3,
+    return AE(output_emb_width=1024, down_t=4, stride_t=2, width=1024, depth=3,
                  dilation_growth_rate=3, activation='relu', norm=None, **kwargs)
 
 AE_models = {
@@ -48,7 +48,7 @@ AE_models = {
 #                                 Inner Architectures                           #
 #################################################################################
 class Encoder(nn.Module):
-    def __init__(self, input_emb_width=3, output_emb_width=512, down_t=2, stride_t=2, width=512, depth=3,
+    def __init__(self, input_emb_width=3, output_emb_width=1024, down_t=4, stride_t=2, width=1024, depth=3,
                  dilation_growth_rate=3, activation='relu', norm=None):
         super().__init__()
         blocks = []
@@ -71,7 +71,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, input_emb_width=3, output_emb_width=512, down_t=2, stride_t=2, width=512, depth=3,
+    def __init__(self, input_emb_width=3, output_emb_width=1024, down_t=4, stride_t=2, width=1024, depth=3,
                  dilation_growth_rate=3, activation='relu', norm=None):
         super().__init__()
         blocks = []

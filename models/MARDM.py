@@ -810,32 +810,20 @@ class CrossAttention(nn.Module):
     def forward(self, x, audio_seq, audio_mask=None):
         """
         Args:
-            x: motion tokens [B, T_motion, C]
-            audio_seq: audio features [B, T_audio, C]
+            x: motion tokens [B, T_motion, C] (batch-first，由 block 传入时已保证)
+            audio_seq: audio features [B, T_audio, C] (batch-first)
             audio_mask: audio padding mask [B, T_audio], True for padding positions
         Returns:
             output: [B, T_motion, C]
         """
-        # Ensure correct dimensions: both should be [B, T, C] format (batch-first)
         if x.dim() != 3 or audio_seq.dim() != 3:
             raise ValueError(f"Expected 3D tensors, got x.shape={x.shape}, audio_seq.shape={audio_seq.shape}")
         
-        # x should be [B, T_motion, C], audio_seq should be [B, T_audio, C]
-        # Check if we need to permute (sequence-first -> batch-first)
-        # Typical: T_motion=45, T_audio=150, B=16, C=1024
-        # If first dim > second dim, it's likely sequence-first format
-        if x.size(0) > x.size(1):
-            # x is [T_motion, B, C], convert to [B, T_motion, C]
-            x = x.permute(1, 0, 2)
-        if audio_seq.size(0) > audio_seq.size(1):
-            # audio_seq is [T_audio, B, C], convert to [B, T_audio, C]
-            audio_seq = audio_seq.permute(1, 0, 2)
-        
-        # Now both should be batch-first: [B, T, C]
+        # 调用方（MARTransBlock）已保证传入 batch-first [B, T, C]，不再根据 dim 猜测 permute
+        # 否则当 B=64、T_motion=18 时会把 [64,18,C] 误判为 sequence-first 并 permute 成 [18,64,C] 导致 batch 错
         B, T_motion, C = x.size()
         B_audio, T_audio, C_audio = audio_seq.size()
         
-        # Verify batch size and feature dimension match
         if B != B_audio:
             raise ValueError(f"Batch size mismatch: x batch={B}, audio_seq batch={B_audio}. x.shape={x.shape}, audio_seq.shape={audio_seq.shape}")
         if C != C_audio:
@@ -952,8 +940,6 @@ class MARTransBlock(nn.Module):
                     audio_mask
                 )
                 # x_cross_batch_first is [B, T_motion, C]
-                
-                # Apply gate: gate_msa is [B, C]
                 gate_for_batch = gate_msa.unsqueeze(1)  # [B, C] -> [B, 1, C] for batch-first format
                 x = x + gate_for_batch * x_cross_batch_first
             else:
@@ -970,11 +956,8 @@ class MARTransBlock(nn.Module):
                     audio_mask
                 )
                 # x_cross_batch_first is [B, T_motion, C]
-                
                 # Convert back to sequence-first format: [B, T_motion, C] -> [T_motion, B, C]
                 x_cross = x_cross_batch_first.permute(1, 0, 2)  # [16, 45, 1024] -> [45, 16, 1024]
-                
-                # Apply gate: gate_msa is [B, C]
                 gate_for_seq = gate_msa.unsqueeze(0)  # [B, C] -> [1, B, C] for sequence-first format
                 x = x + gate_for_seq * x_cross
         
