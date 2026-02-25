@@ -521,6 +521,9 @@ def main(args):
                 logs = defaultdict(def_value, OrderedDict())
                 print_current_loss(start_time, it, total_iters, mean_loss, epoch=epoch, inner_iter=i)
 
+        # 同步：等所有 rank 都跑完本 epoch 再让 rank 0 保存，避免其他 rank 先进入下一 epoch 的 backward 一直等 rank 0 导致 NCCL 超时
+        if args.distributed:
+            dist.barrier()
         if is_main_process:
             if args.distributed:
                 save(pjoin(model_dir, 'latest.tar'), epoch, mardm.module, optimizer, scheduler,
@@ -538,6 +541,9 @@ def main(args):
                     save(pjoin(model_dir, ckpt_name), epoch, mardm, optimizer, scheduler,
                          it, 'mardm', ema_mardm=ema_mardm)
                 print(f'Saved checkpoint: {ckpt_name}')
+        # 等 rank 0 保存完再一起进入下一 epoch，避免其他 rank 在下一 epoch 的 all-reduce 里等 rank 0 导致超时
+        if args.distributed:
+            dist.barrier()
         epoch += 1
         #################################################################################
         #                                      Eval Loop                                #

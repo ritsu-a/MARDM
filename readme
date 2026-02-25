@@ -98,6 +98,8 @@ Train MARDM:
     # 使用 prefix 方式（--audio_feature_mode prefix）:
     torchrun --master_port 29504 --nproc_per_node=8 train_MARDM.py --name MARDM_DDPM_XL_beat_v2_4fps_prefix --model "MARDM-DDPM-XL" --dataset_name beat_v2 --batch_size 64 --ae_name AE --epoch 2000 --milestones 20000 --max_motion_length 300 --save_every_epochs 500 --audio_feature_mode prefix --distributed
 
+    # 多卡训练说明：若出现“训到一半有 7 张卡先结束、loss 异常”等情况，多为 rank0 在写大 checkpoint 时其余 rank 已进入下一 epoch 的 backward，在 all-reduce 处一直等 rank0 导致 NCCL 超时退出。脚本已在每个 epoch 保存前后加 dist.barrier() 同步。若仍超时，可检查单卡是否 OOM 或数据异常（任一张卡崩溃会拖垮整组）。
+
 Test MARDM (beat_v2):
    # 测试时 --audio_feature_mode 需与训练一致。默认 cross_attention；若用 prefix 训练的 checkpoint 请加 --audio_feature_mode prefix。
     # 1. 在test set上展示效果（默认 cross_attention）:
