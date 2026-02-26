@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 from models.AE import AE_models
 from models.MARDM import MARDM_models
-from utils.datasets import G1ML3DText2MotionDataset, collate_fn
+from utils.datasets import G1ML3DText2MotionDataset, BeatSegmentDataset, collate_fn
 import time
 import copy
 from collections import OrderedDict, defaultdict
@@ -31,28 +31,34 @@ def main(args):
     #################################################################################
     #                                    Train Data                                 #
     #################################################################################
-    # G1ML3D dataset configuration
     data_root = args.dataset_dir
-    motion_dir = pjoin(data_root, 'joints_npz')
-    text_dir = pjoin(data_root, 'texts')
-    
-    # Load mean and std
+    use_segment = getattr(args, 'use_segment', False)
+    max_motion_length = args.max_motion_length if args.max_motion_length is not None else (300 if use_segment else 196)
+
     mean_path = pjoin(data_root, 'Mean.npy')
     std_path = pjoin(data_root, 'Std.npy')
-    
     if not os.path.exists(mean_path) or not os.path.exists(std_path):
         raise FileNotFoundError(f"Mean.npy or Std.npy not found in {data_root}. Please run VAE training first.")
-    
     mean = np.load(mean_path)
     std = np.load(std_path)
-    
-    train_split_file = pjoin(data_root, 'train.txt')
-    val_split_file = pjoin(data_root, 'val.txt')
 
-    train_dataset = G1ML3DText2MotionDataset(mean, std, train_split_file, 'g1ml3d', motion_dir, text_dir,
-                                             args.unit_length, args.max_motion_length, 20, evaluation=False)
-    val_dataset = G1ML3DText2MotionDataset(mean, std, val_split_file, 'g1ml3d', motion_dir, text_dir,
-                                           args.unit_length, args.max_motion_length, 20, evaluation=False)
+    if use_segment:
+        segment_dir = pjoin(data_root, 'segment')
+        train_split = pjoin(segment_dir, 'segment_train.txt')
+        val_split = pjoin(segment_dir, 'segment_test.txt')
+        if not os.path.exists(train_split) and not os.path.exists(pjoin(segment_dir, 'segment_train.npz')):
+            raise FileNotFoundError(f"BEAT segment not found: {train_split} or segment_train.npz. Run scripts/beat_segment_to_npz.py first.")
+        train_dataset = BeatSegmentDataset(segment_dir, train_split, mean, std, max_motion_length, 20, evaluation=False)
+        val_dataset = BeatSegmentDataset(segment_dir, val_split, mean, std, max_motion_length, 20, evaluation=False)
+    else:
+        motion_dir = pjoin(data_root, 'joints_npz')
+        text_dir = pjoin(data_root, 'texts')
+        train_split_file = pjoin(data_root, 'train.txt')
+        val_split_file = pjoin(data_root, 'val.txt')
+        train_dataset = G1ML3DText2MotionDataset(mean, std, train_split_file, 'g1ml3d', motion_dir, text_dir,
+                                                 args.unit_length, max_motion_length, 20, evaluation=False)
+        val_dataset = G1ML3DText2MotionDataset(mean, std, val_split_file, 'g1ml3d', motion_dir, text_dir,
+                                               args.unit_length, max_motion_length, 20, evaluation=False)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, num_workers=args.num_workers,
                               shuffle=True)
@@ -64,11 +70,14 @@ def main(args):
     #################################################################################
     eval_loader = None
     if args.need_evaluation:
-        eval_mean = mean  # Use training mean/std for evaluation
-        eval_std = std
-        split_file = pjoin(data_root, 'val.txt')
-        eval_dataset = G1ML3DText2MotionDataset(eval_mean, eval_std, split_file, 'g1ml3d', motion_dir, text_dir,
-                                               4, args.max_motion_length, 20, evaluation=True)
+        eval_mean, eval_std = mean, std
+        if use_segment:
+            split_file = pjoin(segment_dir, 'segment_test.txt')
+            eval_dataset = BeatSegmentDataset(segment_dir, split_file, eval_mean, eval_std, max_motion_length, 20, evaluation=True)
+        else:
+            split_file = pjoin(data_root, 'val.txt')
+            eval_dataset = G1ML3DText2MotionDataset(eval_mean, eval_std, split_file, 'g1ml3d', motion_dir, text_dir,
+                                                   4, max_motion_length, 20, evaluation=True)
         eval_loader = DataLoader(eval_dataset, batch_size=32, num_workers=args.num_workers, drop_last=True,
                                  collate_fn=collate_fn, shuffle=True)
     #################################################################################
@@ -82,7 +91,11 @@ def main(args):
     
     # Load VAE (AE) model
     ae = AE_models[args.ae_model](input_width=dim_pose)
-    ae_checkpoint_path = pjoin(args.checkpoints_dir, 'g1ml3d', args.ae_name, 'model', args.ae_checkpoint_name)
+    ae_checkpoint_path = getattr(args, 'ae_checkpoint_dir', None)
+    if ae_checkpoint_path:
+        ae_checkpoint_path = pjoin(ae_checkpoint_path, args.ae_checkpoint_name)
+    else:
+        ae_checkpoint_path = pjoin(args.checkpoints_dir, 'g1ml3d', args.ae_name, 'model', args.ae_checkpoint_name)
     if not os.path.exists(ae_checkpoint_path):
         raise FileNotFoundError(f"AE checkpoint not found: {ae_checkpoint_path}")
     
@@ -91,16 +104,24 @@ def main(args):
     ae.load_state_dict(ckpt[model_key])
     print(f"Loaded VAE from {ae_checkpoint_path}")
 
-    # Create MARDM model
-    mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode='text')
+    # Create MARDM model（use_segment 时用 whisper 条件，否则 text）
+    cond_mode = getattr(args, 'cond_mode', None) or ('whisper' if use_segment else 'text')
+    whisper_dim = None
+    if cond_mode == 'whisper':
+        # 从数据推断 whisper 特征维度（segment 可能为 512 或 1024）
+        sample_whisper = train_dataset[0][0]
+        whisper_dim = sample_whisper.shape[-1]
+        print(f'Whisper condition dim (from data): {whisper_dim}')
+    mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, whisper_dim=whisper_dim or 512)
     ema_mardm = copy.deepcopy(mardm)
     ema_mardm.eval()
     for param in ema_mardm.parameters():
         param.requires_grad_(False)
 
     all_params = 0
+    exclude_prefix = 'clip_model.' if cond_mode == 'text' else ''
     pc_transformer = sum(param.numel() for param in
-                         [p for name, p in mardm.named_parameters() if not name.startswith('clip_model.')])
+                         [p for name, p in mardm.named_parameters() if not name.startswith(exclude_prefix)])
     all_params += pc_transformer
     print('Total parameters of all models: {:.2f}M'.format(all_params / 1000_000))
 
@@ -128,8 +149,12 @@ def main(args):
             checkpoint = torch.load(checkpoint_path, map_location=device)
             missing_keys, unexpected_keys = mardm.load_state_dict(checkpoint['mardm'], strict=False)
             missing_keys2, unexpected_keys2 = ema_mardm.load_state_dict(checkpoint['ema_mardm'], strict=False)
-            assert len(unexpected_keys) == 0
-            assert len(unexpected_keys2) == 0
+            if cond_mode == 'text':
+                assert len(unexpected_keys) == 0 and len(unexpected_keys2) == 0
+            else:
+                # whisper 等模式：允许 ckpt 中多出 clip_model（从 text 切到 whisper 时忽略）
+                assert all([k.startswith('clip_model.') for k in unexpected_keys])
+                assert all([k.startswith('clip_model.') for k in unexpected_keys2])
             assert all([k.startswith('clip_model.') for k in missing_keys])
             assert all([k.startswith('clip_model.') for k in missing_keys2])
             optimizer.load_state_dict(checkpoint['opt_mardm'])
@@ -194,8 +219,8 @@ def main(args):
         save(pjoin(model_dir, 'latest.tar'), epoch, mardm, optimizer, scheduler,
              it, 'mardm', ema_mardm=ema_mardm)
         
-        # Save checkpoint every 200 epochs
-        if (epoch + 1) % 500 == 0:
+        # Save checkpoint every 100 epochs
+        if (epoch + 1) % 100 == 0:
             checkpoint_name = f'checkpoint_epoch_{epoch+1}.tar'
             save(pjoin(model_dir, checkpoint_name), epoch, mardm, optimizer, scheduler,
                  it, 'mardm', ema_mardm=ema_mardm)
@@ -245,10 +270,17 @@ if __name__ == "__main__":
     parser.add_argument('--ae_model', type=str, default='AE_Model')
     parser.add_argument('--ae_checkpoint_name', type=str, default='latest.tar',
                         help='AE checkpoint file name (latest.tar or net_best_fid.tar)')
+    parser.add_argument('--ae_checkpoint_dir', type=str, default=None,
+                        help='AE 模型目录（含 checkpoint 文件）；BEAT mixed 可用 ./checkpoints/mixed/ae/model')
+    parser.add_argument('--use_segment', action='store_true',
+                        help='使用 BEAT segment（dataset_dir/segment/segment_train.npz 等）')
+    parser.add_argument('--cond_mode', type=str, default=None, choices=['text', 'whisper'],
+                        help='条件类型：text=CLIP 文本；whisper=Whisper 音频特征。use_segment 时默认 whisper')
     parser.add_argument('--model', type=str, default='MARDM-SiT-XL')
     parser.add_argument('--dataset_dir', type=str, default='./data/G1ML3D_v1',
                         help='Root directory of G1ML3D dataset')
-    parser.add_argument("--max_motion_length", type=int, default=196)
+    parser.add_argument("--max_motion_length", type=int, default=None,
+                        help='Motion 最大帧数；use_segment 时默认 300')
     parser.add_argument("--unit_length", type=int, default=4)
     parser.add_argument('--batch_size', default=64, type=int)
 

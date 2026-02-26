@@ -15,7 +15,7 @@ from utils.train_utils import lengths_to_mask, uniform, get_mask_subset_prob, co
 #################################################################################
 class MARDM(nn.Module):
     def __init__(self, ae_dim, cond_mode, latent_dim=256, ff_size=1024, num_layers=8,
-                 num_heads=4, dropout=0.2, clip_dim=512,
+                 num_heads=4, dropout=0.2, clip_dim=512, whisper_dim=512,
                  diffmlps_batch_mul=4, diffmlps_model='SiT-XL', cond_drop_prob=0.1,
                  clip_version='ViT-B/32', **kargs):
         super(MARDM, self).__init__()
@@ -23,6 +23,7 @@ class MARDM(nn.Module):
         self.ae_dim = ae_dim
         self.latent_dim = latent_dim
         self.clip_dim = clip_dim
+        self.whisper_dim = whisper_dim
         self.dropout = dropout
 
         self.cond_mode = cond_mode
@@ -44,6 +45,8 @@ class MARDM(nn.Module):
 
         if self.cond_mode == 'text':
             self.cond_emb = nn.Linear(self.clip_dim, self.latent_dim)
+        elif self.cond_mode == 'whisper':
+            self.cond_emb = nn.Linear(self.whisper_dim, self.latent_dim)
         elif self.cond_mode == 'action':
             self.cond_emb = nn.Linear(self.num_actions, self.latent_dim)
         elif self.cond_mode == 'uncond':
@@ -62,6 +65,8 @@ class MARDM(nn.Module):
             print('Loading CLIP...')
             self.clip_version = clip_version
             self.clip_model = self.load_and_freeze_clip(clip_version)
+        elif self.cond_mode == 'whisper':
+            self.clip_model = None
 
         # --------------------------------------------------------------------------
         # DiffMLPs
@@ -139,6 +144,10 @@ class MARDM(nn.Module):
         if self.cond_mode == 'text':
             with torch.no_grad():
                 cond_vector = self.encode_text(y)
+        elif self.cond_mode == 'whisper':
+            # y: (B, T, whisper_dim), pool over time -> (B, whisper_dim)；forward() 内再做 cond_emb
+            y = y.to(device).float()
+            cond_vector = y.mean(dim=1)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(y).to(device).float()
         elif self.cond_mode == 'uncond':
@@ -219,6 +228,9 @@ class MARDM(nn.Module):
         if self.cond_mode == 'text':
             with torch.no_grad():
                 cond_vector = self.encode_text(conds)
+        elif self.cond_mode == 'whisper':
+            conds = conds.to(device).float()
+            cond_vector = conds.mean(dim=1)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':
@@ -270,6 +282,9 @@ class MARDM(nn.Module):
         if self.cond_mode == 'text':
             with torch.no_grad():
                 cond_vector = self.encode_text(conds)
+        elif self.cond_mode == 'whisper':
+            conds = conds.to(device).float()
+            cond_vector = conds.mean(dim=1)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(conds).to(device)
         elif self.cond_mode == 'uncond':

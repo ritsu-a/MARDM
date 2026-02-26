@@ -800,7 +800,8 @@ class BeatSegmentDataset(data.Dataset):
             pos_one_hots = np.ascontiguousarray(pos_one_hots)
             word_embeddings = np.ascontiguousarray(word_embeddings)
             return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, '_'.join(tokens), whisper_out
-        return caption, motion, m_length
+        # 训练时返回 whisper 作为条件（与 caption 同位置），便于 MARDM cond_mode='whisper'
+        return whisper_out, motion, m_length
 
     def transform(self, data, mean=None, std=None):
         if mean is None and std is None:

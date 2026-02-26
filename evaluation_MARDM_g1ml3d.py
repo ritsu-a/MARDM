@@ -10,7 +10,7 @@ import random
 from torch.utils.data import DataLoader
 from models.AE import AE_models
 from models.MARDM import MARDM_models
-from utils.datasets import G1ML3DText2MotionDataset, collate_fn
+from utils.datasets import G1ML3DText2MotionDataset, BeatSegmentDataset, collate_fn
 import argparse
 import subprocess
 import tempfile
@@ -93,8 +93,8 @@ def main(args):
 
     # Paths
     data_root = args.dataset_dir
-    motion_dir = pjoin(data_root, 'joints_npz')
-    text_dir = pjoin(data_root, 'texts')
+    use_segment = getattr(args, 'use_segment', False)
+    cond_mode = getattr(args, 'cond_mode', None) or ('whisper' if use_segment else 'text')
     mean_path = pjoin(data_root, 'Mean.npy')
     std_path = pjoin(data_root, 'Std.npy')
     if not os.path.exists(mean_path) or not os.path.exists(std_path):
@@ -102,9 +102,15 @@ def main(args):
     mean = np.load(mean_path)
     std = np.load(std_path)
 
-    split_file = pjoin(data_root, args.split_file)
-    if not os.path.exists(split_file):
-        raise FileNotFoundError(f"Split file not found: {split_file}")
+    if use_segment:
+        segment_dir = pjoin(data_root, 'segment')
+        split_file = pjoin(segment_dir, args.split_file if args.split_file != 'val.txt' else 'segment_test.txt')
+        if not os.path.exists(split_file) and not os.path.exists(pjoin(segment_dir, 'segment_test.npz')):
+            raise FileNotFoundError(f"BEAT segment split not found: {split_file} or segment_test.npz")
+    else:
+        split_file = pjoin(data_root, args.split_file)
+        if not os.path.exists(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
 
     # MARDM checkpoint: allow full path or name under model dir
     if os.path.isabs(args.checkpoint_name) and os.path.isfile(args.checkpoint_name):
@@ -116,18 +122,30 @@ def main(args):
         raise FileNotFoundError(f"MARDM checkpoint not found: {mardm_ckpt_path}")
 
     # AE checkpoint
-    ae_ckpt_path = pjoin(args.checkpoints_dir, 'g1ml3d', args.ae_name, 'model', args.ae_checkpoint_name)
+    ae_checkpoint_dir = getattr(args, 'ae_checkpoint_dir', None)
+    if ae_checkpoint_dir:
+        ae_ckpt_path = pjoin(ae_checkpoint_dir, args.ae_checkpoint_name)
+    else:
+        ae_ckpt_path = pjoin(args.checkpoints_dir, 'g1ml3d', args.ae_name, 'model', args.ae_checkpoint_name)
     if not os.path.isfile(ae_ckpt_path):
         raise FileNotFoundError(f"AE checkpoint not found: {ae_ckpt_path}")
 
     dim_pose = mean.shape[0]
-    max_motion_length = args.max_motion_length
+    ae_width = getattr(args, 'ae_width', 512)
+    max_motion_length = args.max_motion_length if args.max_motion_length is not None else (300 if use_segment else 196)
 
     # Datasets & loader
-    eval_dataset = G1ML3DText2MotionDataset(
-        mean, std, split_file, 'g1ml3d', motion_dir, text_dir,
-        4, max_motion_length, 20, evaluation=True
-    )
+    if use_segment:
+        eval_dataset = BeatSegmentDataset(
+            segment_dir, split_file, mean, std, max_motion_length, 20, evaluation=True
+        )
+    else:
+        motion_dir = pjoin(data_root, 'joints_npz')
+        text_dir = pjoin(data_root, 'texts')
+        eval_dataset = G1ML3DText2MotionDataset(
+            mean, std, split_file, 'g1ml3d', motion_dir, text_dir,
+            4, max_motion_length, 20, evaluation=True
+        )
     eval_loader = DataLoader(
         eval_dataset, batch_size=args.batch_size, num_workers=args.num_workers,
         drop_last=False, collate_fn=collate_fn, shuffle=False
@@ -138,13 +156,32 @@ def main(args):
     ckpt_ae = torch.load(ae_ckpt_path, map_location='cpu')
     ae.load_state_dict(ckpt_ae['ae'])
 
-    ema_mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode='text')
+    whisper_dim = None
+    if cond_mode == 'whisper':
+        # BeatSegmentDataset(evaluation=True) 返回 8 元组，最后一个是 whisper_out: (T, D)
+        sample = eval_dataset[0]
+        if isinstance(sample, (list, tuple)) and len(sample) >= 8:
+            whisper_dim = sample[7].shape[-1]
+        else:
+            raise RuntimeError("cond_mode=whisper 需要 eval_dataset 返回 whisper_out（8 元组）。")
+        print(f'Whisper condition dim (from data): {whisper_dim}')
+
+    ema_mardm = MARDM_models[args.model](
+        ae_dim=ae.output_emb_width,
+        cond_mode=cond_mode,
+        whisper_dim=whisper_dim or 512
+    )
     ckpt_mardm = torch.load(mardm_ckpt_path, map_location='cpu')
     if 'ema_mardm' not in ckpt_mardm:
         raise KeyError("Checkpoint must contain 'ema_mardm' key.")
     missing, unexpected = ema_mardm.load_state_dict(ckpt_mardm['ema_mardm'], strict=False)
-    assert len(unexpected) == 0
-    assert all(k.startswith('clip_model.') for k in missing)
+    if cond_mode == 'text':
+        assert len(unexpected) == 0
+        assert all(k.startswith('clip_model.') for k in missing)
+    else:
+        # whisper 等模式：允许 ckpt 里有 clip_model（从 text 切到 whisper 时忽略）
+        assert all(k.startswith('clip_model.') for k in unexpected)
+        assert all(k.startswith('clip_model.') for k in missing)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ae.eval()
@@ -164,9 +201,12 @@ def main(args):
     total_count = 0
     vis_samples = []
     sample_count = 0
+    max_eval_samples = args.max_eval_samples if args.max_eval_samples is not None else None
 
     for i, batch in enumerate(tqdm(eval_loader, desc="Evaluating")):
-        word_embeddings, pos_one_hots, caption, sent_len, motion_gt, m_length, _ = batch
+        # G1ML3D 返回 7 元组；BEAT segment 返回 8 元组（多 whisper），取前 7
+        word_embeddings, pos_one_hots, caption, sent_len, motion_gt, m_length, _ = batch[:7]
+        whisper_feat = batch[7] if (use_segment and len(batch) >= 8) else None
         motion_gt = motion_gt.float().to(device)
         m_length = m_length.long().to(device)
 
@@ -180,8 +220,14 @@ def main(args):
         m_lens = (m_length // VAE_DOWNSAMPLE_FACTOR).long().to(device).clamp(min=1)
 
         with torch.no_grad():
+            if cond_mode == 'whisper':
+                if whisper_feat is None:
+                    raise RuntimeError("use_segment 且 cond_mode=whisper 时，batch 需要包含 whisper_feat。")
+                conds_in = whisper_feat.to(device).float()
+            else:
+                conds_in = captions
             pred_latents = ema_mardm.generate(
-                captions, m_lens, args.time_steps, args.cfg,
+                conds_in, m_lens, args.time_steps, args.cfg,
                 temperature=args.temperature, hard_pseudo_reorder=args.hard_pseudo_reorder
             )
             pred_motions = ae.decode(pred_latents)
@@ -210,8 +256,9 @@ def main(args):
             base_name = f"{prompt_base}_b{i:04d}_j{j:02d}"
 
             # Save npz with prompt-based name
-            npz_name = f"{base_name}.npz"
-            np.savez(pjoin(npz_dir, npz_name), qpos=pred_j)
+            if (max_eval_samples is None) or (total_count <= max_eval_samples):
+                npz_name = f"{base_name}.npz"
+                np.savez(pjoin(npz_dir, npz_name), qpos=pred_j)
 
             # Collect samples for visualization
             if sample_count < args.num_vis_samples:
@@ -222,6 +269,11 @@ def main(args):
                     'caption': caption_j,
                 })
                 sample_count += 1
+
+            if (max_eval_samples is not None) and (total_count >= max_eval_samples) and (sample_count >= args.num_vis_samples):
+                break
+        if (max_eval_samples is not None) and (total_count >= max_eval_samples) and (sample_count >= args.num_vis_samples):
+            break
 
     avg_mse = total_mse / total_count if total_count else float('nan')
     msg = f"Evaluated {total_count} samples. Mean MSE: {avg_mse:.6f}\n"
@@ -286,10 +338,17 @@ if __name__ == "__main__":
     parser.add_argument('--model', type=str, default='MARDM-SiT-XL')
     parser.add_argument('--dataset_dir', type=str, default='./data/G1ML3D_v1')
     parser.add_argument('--split_file', type=str, default='val.txt')
-    parser.add_argument('--max_motion_length', type=int, default=196)
     parser.add_argument('--checkpoint_name', type=str, default='checkpoint_epoch_600.tar',
                         help='Checkpoint file name or full path, e.g. checkpoint_epoch_600.tar')
     parser.add_argument('--ae_checkpoint_name', type=str, default='latest.tar')
+    parser.add_argument('--ae_checkpoint_dir', type=str, default=None,
+                        help='AE 模型目录；BEAT mixed 可用 ./checkpoints/mixed/ae/model')
+    parser.add_argument('--ae_width', type=int, default=512, help='AE 隐藏维度，mixed 为 1024')
+    parser.add_argument('--use_segment', action='store_true', help='使用 BEAT segment 数据')
+    parser.add_argument('--cond_mode', type=str, default=None, choices=['text', 'whisper'],
+                        help='条件类型：text=CLIP 文本；whisper=Whisper 音频特征。use_segment 时默认 whisper')
+    parser.add_argument('--max_motion_length', type=int, default=None,
+                        help='Motion 最大帧数；use_segment 时默认 300')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--time_steps', type=int, default=18)
     parser.add_argument('--cfg', type=float, default=4.5)
@@ -297,6 +356,8 @@ if __name__ == "__main__":
     parser.add_argument('--hard_pseudo_reorder', action='store_true')
     parser.add_argument('--num_vis_samples', type=int, default=5,
                         help='Number of GT vs Pred comparison videos')
+    parser.add_argument('--max_eval_samples', type=int, default=None,
+                        help='最多处理多少条样本（用于只可视化少量 segment，加速测试）；None=全量')
     parser.add_argument('--num_render_npz', type=int, default=-1,
                         help='Render generated npz to video: -1=all, 0=none, N=first N')
     parser.add_argument('--vis_robot', type=str, default='g1_brainco')

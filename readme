@@ -65,10 +65,65 @@ python evaluation_AE_g1ml3d.py \
     --dataset_type beat --use_segment \
     --dataset_dir ./data/BEAT_v2 \
     --name AE_mixed \
-    --model_dir ./checkpoints/mixed/AE/model \
+    --model_dir ./checkpoints/mixed/ae/model \
+    --ae_width 1024 \
     --split_file segment_test.txt \
     --checkpoint_name latest.tar \
     --checkpoints_dir ./checkpoints \
     --num_vis_samples 5 \
     --vis_robot g1_brainco \
     --motion_fps 60
+
+在 BEAT segment 上训练 MARDM（需先完成 BEAT 切片与 mixed VAE）：
+    python train_MARDM_g1ml3d.py \
+        --dataset_dir ./data/BEAT_v2 \
+        --use_segment \
+        --name MARDM_beat \
+        --ae_checkpoint_dir ./checkpoints/mixed/AE/model \
+        --ae_checkpoint_name latest.tar \
+        --batch_size 64 \
+        --epoch 3000 \
+        --lr 2e-4 \
+        --checkpoints_dir ./checkpoints
+    # use_segment 时默认 --cond_mode whisper（用 Whisper 特征作条件，不用文本）；max_motion_length=300
+
+在 BEAT segment 上测试 MARDM：
+    python evaluation_MARDM_g1ml3d.py \
+        --dataset_dir ./data/BEAT_v2 \
+        --use_segment \
+        --name MARDM_beat \
+        --ae_checkpoint_dir ./checkpoints/mixed/AE/model \
+        --split_file segment_test.txt \
+        --checkpoint_name checkpoint_epoch_400.tar \
+        --checkpoints_dir ./checkpoints \
+        --num_vis_samples 20 \
+        --max_eval_samples 20 \
+        --num_render_npz 0 \
+        --vis_robot g1_brainco \
+        --motion_fps 60
+
+从训练集取 segment、每生成一段立即可视化（输出到 eval_train/visualizations）：
+
+    CUDA_VISIBLE_DEVICES=2 python evaluation_MARDM_g1ml3d_train_vis.py \
+        --dataset_dir ./data/BEAT_v2 \
+        --name MARDM_beat \
+        --ae_checkpoint_dir ./checkpoints/mixed/AE/model \
+        --checkpoint_name checkpoint_epoch_400.tar \
+        --checkpoints_dir ./checkpoints \
+        --num_segments 20 \
+        --vis_robot g1_brainco \
+        --motion_fps 60
+    # 默认用 segment_train.txt；可加 --shuffle_train 随机取段
+
+在测试集上同样方式 eval（只读 20 段、逐段生成并可视化，输出到 eval_test/）：
+    CUDA_VISIBLE_DEVICES=2 python evaluation_MARDM_g1ml3d_train_vis.py \
+        --dataset_dir ./data/BEAT_v2 \
+        --name MARDM_beat \
+        --ae_checkpoint_dir ./checkpoints/mixed/AE/model \
+        --checkpoint_name checkpoint_epoch_400.tar \
+        --checkpoints_dir ./checkpoints \
+        --split_file segment_test.txt \
+        --num_segments 20 \
+        --vis_robot g1_brainco \
+        --motion_fps 60
+    # 输出到 eval_test/visualizations、eval_test/generated_npz
