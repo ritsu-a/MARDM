@@ -812,3 +812,72 @@ class BeatSegmentDataset(data.Dataset):
         if mean is None and std is None:
             return data * self.std + self.mean
         return data * std + mean
+
+
+class SemiSyntheticSegmentDataset(data.Dataset):
+    """
+    Text2Motion 数据集：semi_synthetic_v2_segments 等目录，每段有 *_motion.npz（动作 qpos）与 *_clip_description.npy（CLIP 文本特征）。
+    用于 MARDM cond_mode='clip' 的 text2motion 训练。
+    """
+    def __init__(self, segment_dir, split_file, mean, std, max_motion_length, clip_dir=None, evaluation=False):
+        self.segment_dir = os.path.abspath(segment_dir)
+        self.clip_dir = os.path.abspath(clip_dir) if clip_dir else self.segment_dir
+        self.mean = mean
+        self.std = std
+        self.max_motion_length = max_motion_length
+        self.evaluation = evaluation
+        split_path = split_file if os.path.isabs(split_file) else pjoin(self.segment_dir, os.path.basename(split_file))
+        if not os.path.exists(split_path):
+            split_path = split_file
+        with open(split_path, "r") as f:
+            self.name_list = [line.strip() for line in f if line.strip()]
+        # 过滤：同时存在 motion.npz 与 clip_description.npy 的 id
+        valid = []
+        for sid in self.name_list:
+            motion_path = pjoin(self.segment_dir, sid + "_motion.npz")
+            clip_path = pjoin(self.clip_dir, sid + "_clip_description.npy")
+            if os.path.exists(motion_path) and os.path.exists(clip_path):
+                valid.append(sid)
+        self.name_list = valid
+        print("SemiSyntheticSegmentDataset: {} segments (from split, with motion+clip)".format(len(self.name_list)))
+
+    def __len__(self):
+        return len(self.name_list)
+
+    def __getitem__(self, item):
+        sid = self.name_list[item]
+        motion_path = pjoin(self.segment_dir, sid + "_motion.npz")
+        clip_path = pjoin(self.clip_dir, sid + "_clip_description.npy")
+        motion_data = np.load(motion_path)
+        if "qpos" in motion_data:
+            motion = motion_data["qpos"].copy()
+        else:
+            keys = list(motion_data.keys())
+            motion = motion_data[keys[0]].copy()
+        clip_feat = np.load(clip_path).astype(np.float32).flatten()
+        dim_m = motion.shape[1]
+        m_length = motion.shape[0]
+        if m_length > self.max_motion_length:
+            motion = motion[:self.max_motion_length]
+            m_length = self.max_motion_length
+        elif m_length < self.max_motion_length:
+            motion = np.concatenate([
+                motion,
+                np.zeros((self.max_motion_length - m_length, dim_m), dtype=np.float32)
+            ], axis=0)
+        motion = motion[:, :self.mean.shape[0]]
+        motion = (motion - self.mean) / self.std
+        motion = np.ascontiguousarray(motion)
+        if self.evaluation:
+            return clip_feat, motion, m_length, sid
+        return clip_feat, motion, m_length
+
+    def transform(self, data, mean=None, std=None):
+        if mean is None and std is None:
+            return (data - self.mean) / self.std
+        return (data - mean) / std
+
+    def inv_transform(self, data, mean=None, std=None):
+        if mean is None and std is None:
+            return data * self.std + self.mean
+        return data * std + mean

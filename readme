@@ -1,5 +1,28 @@
 Visualization of converted humanml3d npz data:
-    python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/G1ML3D_v1/joints_npz/000000.npz --motion_fps 60
+    python /root/workspace/MARDM/external/GMR/scripts/vis_npz_motion.py --npz_path /root/workspace/MARDM/data/semi_synthetic_v2_segments/1_ARMS_SPHERICAL-6_0_motion.npz --motion_fps 60
+
+semi_synthetic text2motion（v2 段：*_motion.npz 动作 + *_clip_description.npy CLIP 特征）:
+    生成 train/val 划分（只保留同时有 motion.npz 与 clip_description.npy 的段）:
+    python scripts/split_semi_synthetic.py --segment_dir ./data/semi_synthetic_v2_segments --train_ratio 0.9 --val_ratio 0.1
+    # 若 CLIP 特征在 v1、动作用 v2，可指定:  --clip_dir ./data/semi_synthetic_v1_segments
+
+    训练前需在 segment 目录或 --mean_std_dir 下提供 Mean.npy、Std.npy（可与 BEAT mixed VAE 共用，复制自 ./data/BEAT_v2 或对应 VAE 输出目录）。
+
+    在 semi_synthetic_v2_segments 上训练 MARDM（text2motion，条件为预计算 CLIP 特征）:
+    CUDA_VISIBLE_DEVICES=3 python train_MARDM_g1ml3d.py \
+        --dataset_dir ./data/semi_synthetic_v2_segments \
+        --use_semi_synthetic \
+        --name MARDM_semi_synth \
+        --ae_checkpoint_dir ./checkpoints/mixed/AE/model \
+        --ae_checkpoint_name latest.tar \
+        --mean_std_dir ./data/BEAT_v2 \
+        --batch_size 64 \
+        --max_motion_length 300 \
+        --epoch 3000 \
+        --lr 2e-4 \
+        --checkpoints_dir ./checkpoints
+    # 若 CLIP 特征从 v1 读取:  --clip_segments_dir ./data/semi_synthetic_v1_segments
+    # 默认为「整段预测」（如 300 帧）；若要用「前 64 帧作条件预测后 224 帧」（共 288 帧）则加上:  --use_prefix_condition
 
 Train G1ML3D vae:
     python train_AE_g1ml3d.py \
@@ -85,7 +108,20 @@ python evaluation_AE_g1ml3d.py \
         --epoch 3000 \
         --lr 2e-4 \
         --checkpoints_dir ./checkpoints
-    # use_segment 时默认 --cond_mode whisper（用 Whisper 特征作条件，不用文本）；max_motion_length=300
+    # use_segment 时默认 --cond_mode whisper；max_motion_length=300
+
+    前 64 帧 + 音频预测后 224 帧（共 288 帧）：
+    python train_MARDM_g1ml3d.py \
+        --dataset_dir ./data/BEAT_v2 \
+        --use_segment \
+        --use_prefix_condition \
+        --name MARDM_beat \
+        --ae_checkpoint_dir ./checkpoints/mixed/AE/model \
+        --ae_checkpoint_name latest.tar \
+        --batch_size 64 \
+        --epoch 3000 \
+        --lr 2e-4 \
+        --checkpoints_dir ./checkpoints
 
 在 BEAT segment 上测试 MARDM：
     python evaluation_MARDM_g1ml3d.py \
@@ -127,3 +163,17 @@ python evaluation_AE_g1ml3d.py \
         --vis_robot g1_brainco \
         --motion_fps 60
     # 输出到 eval_test/visualizations、eval_test/generated_npz
+
+train on 64 frame history
+
+CUDA_VISIBLE_DEVICES=2 python train_MARDM_g1ml3d.py \
+    --dataset_dir ./data/BEAT_v2 \
+    --use_segment \
+    --use_prefix_condition \
+    --name MARDM_beat_64history \
+    --ae_checkpoint_dir ./checkpoints/mixed/AE/model \
+    --ae_checkpoint_name latest.tar \
+    --batch_size 64 \
+    --epoch 3000 \
+    --lr 2e-4 \
+    --checkpoints_dir ./checkpoints

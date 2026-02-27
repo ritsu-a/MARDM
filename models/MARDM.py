@@ -28,6 +28,7 @@ class MARDM(nn.Module):
 
         self.cond_mode = cond_mode
         self.cond_drop_prob = cond_drop_prob
+        self.use_prefix_condition = kargs.get('use_prefix_condition', False)
 
         if self.cond_mode == 'action':
             assert 'num_actions' in kargs
@@ -43,7 +44,7 @@ class MARDM(nn.Module):
             MARTransBlock(self.latent_dim, num_heads, mlp_size=ff_size, drop_out=self.dropout) for _ in range(num_layers)
         ])
 
-        if self.cond_mode == 'text':
+        if self.cond_mode == 'text' or self.cond_mode == 'clip':
             self.cond_emb = nn.Linear(self.clip_dim, self.latent_dim)
         elif self.cond_mode == 'whisper':
             self.cond_emb = nn.Linear(self.whisper_dim, self.latent_dim)
@@ -55,6 +56,8 @@ class MARDM(nn.Module):
             raise KeyError("Unsupported condition mode!!!")
 
         self.mask_latent = nn.Parameter(torch.zeros(1, 1, self.ae_dim))
+        if self.use_prefix_condition:
+            self.prefix_emb = nn.Linear(self.ae_dim, self.latent_dim)
 
         self.apply(self.__init_weights)
         for block in self.MARTransformer:
@@ -65,7 +68,7 @@ class MARDM(nn.Module):
             print('Loading CLIP...')
             self.clip_version = clip_version
             self.clip_model = self.load_and_freeze_clip(clip_version)
-        elif self.cond_mode == 'whisper':
+        elif self.cond_mode in ('whisper', 'clip'):
             self.clip_model = None
 
         # --------------------------------------------------------------------------
@@ -111,10 +114,11 @@ class MARDM(nn.Module):
         else:
             return cond
 
-    def forward(self, latents, cond, padding_mask, force_mask=False, mask=None):
+    def forward(self, latents, cond, padding_mask, force_mask=False, mask=None, cond_already_embedded=False):
         cond = self.mask_cond(cond, force_mask=force_mask)
         x = self.input_process(latents)
-        cond = self.cond_emb(cond)
+        if not cond_already_embedded:
+            cond = self.cond_emb(cond)
         x = self.position_enc(x)
         x = x.permute(1, 0, 2)
         if mask is not None: # hard pseudo reorder, in practice, after pe, for transformer encoder architecture should be near same without hard because of bidirectional attention.
@@ -144,10 +148,18 @@ class MARDM(nn.Module):
         if self.cond_mode == 'text':
             with torch.no_grad():
                 cond_vector = self.encode_text(y)
+        elif self.cond_mode == 'clip':
+            cond_vector = self.cond_emb(y.to(latents.device).float())
         elif self.cond_mode == 'whisper':
-            # y: (B, T, whisper_dim), pool over time -> (B, whisper_dim)；forward() 内再做 cond_emb
-            y = y.to(device).float()
-            cond_vector = y.mean(dim=1)
+            # y 可为 (whisper,) 或 (whisper, prefix_latent)；prefix_latent: (B, ae_dim, 4)
+            if isinstance(y, (list, tuple)) and len(y) == 2:
+                whisper_feat, prefix_latent = y
+                whisper_feat = whisper_feat.to(device).float()
+                prefix_latent = prefix_latent.to(device).float()
+                cond_vector = self.cond_emb(whisper_feat.mean(dim=1)) + self.prefix_emb(prefix_latent.mean(dim=2))
+            else:
+                y = y.to(device).float()
+                cond_vector = y.mean(dim=1)
         elif self.cond_mode == 'action':
             cond_vector = self.enc_action(y).to(device).float()
         elif self.cond_mode == 'uncond':
@@ -168,7 +180,8 @@ class MARDM(nn.Module):
         mask_mlatents = get_mask_subset_prob(mask & ~mask_rlatents, 0.88)
         input = torch.where(mask_mlatents.unsqueeze(-1), self.mask_latent.repeat(b, l, 1), input)
 
-        z = self.forward(input, cond_vector, ~non_pad_mask, force_mask)
+        cond_ready = (self.cond_mode == 'clip') or (isinstance(y, (list, tuple)) and len(y) == 2)
+        z = self.forward(input, cond_vector, ~non_pad_mask, force_mask, cond_already_embedded=cond_ready)
         target = target.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         z = z.reshape(b * l, -1).repeat(self.diffmlps_batch_mul, 1)
         mask = mask.reshape(b * l).repeat(self.diffmlps_batch_mul)
@@ -228,6 +241,8 @@ class MARDM(nn.Module):
         if self.cond_mode == 'text':
             with torch.no_grad():
                 cond_vector = self.encode_text(conds)
+        elif self.cond_mode == 'clip':
+            cond_vector = self.cond_emb(conds.to(device).float())
         elif self.cond_mode == 'whisper':
             conds = conds.to(device).float()
             cond_vector = conds.mean(dim=1)
@@ -282,6 +297,8 @@ class MARDM(nn.Module):
         if self.cond_mode == 'text':
             with torch.no_grad():
                 cond_vector = self.encode_text(conds)
+        elif self.cond_mode == 'clip':
+            cond_vector = self.cond_emb(conds.to(device).float())
         elif self.cond_mode == 'whisper':
             conds = conds.to(device).float()
             cond_vector = conds.mean(dim=1)
@@ -336,10 +353,10 @@ class MARDM(nn.Module):
 #                                     MARDM Zoos                                #
 #################################################################################
 def mardm_ddpm_xl(**kwargs):
-    return MARDM(latent_dim=1024, ff_size=4096, num_layers=1, num_heads=16, dropout=0.2, clip_dim=512,
+    return MARDM(latent_dim=1024, ff_size=4096, num_layers=1, num_heads=16, dropout=0.2,
                  diffmlps_model="DDPM-XL", diffmlps_batch_mul=4, cond_drop_prob=0.1, **kwargs)
 def mardm_sit_xl(**kwargs):
-    return MARDM(latent_dim=1024, ff_size=4096, num_layers=1, num_heads=16, dropout=0.2, clip_dim=512,
+    return MARDM(latent_dim=1024, ff_size=4096, num_layers=1, num_heads=16, dropout=0.2,
                  diffmlps_model="SiT-XL", diffmlps_batch_mul=4, cond_drop_prob=0.1, **kwargs)
 
 MARDM_models = {

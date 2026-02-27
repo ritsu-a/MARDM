@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 from models.AE import AE_models
 from models.MARDM import MARDM_models
-from utils.datasets import G1ML3DText2MotionDataset, BeatSegmentDataset, collate_fn
+from utils.datasets import G1ML3DText2MotionDataset, BeatSegmentDataset, SemiSyntheticSegmentDataset, collate_fn
 import time
 import copy
 from collections import OrderedDict, defaultdict
@@ -33,16 +33,28 @@ def main(args):
     #################################################################################
     data_root = args.dataset_dir
     use_segment = getattr(args, 'use_segment', False)
-    max_motion_length = args.max_motion_length if args.max_motion_length is not None else (300 if use_segment else 196)
+    use_semi_synthetic = getattr(args, 'use_semi_synthetic', False)
+    max_motion_length = args.max_motion_length if args.max_motion_length is not None else (300 if (use_segment or use_semi_synthetic) else 196)
 
-    mean_path = pjoin(data_root, 'Mean.npy')
-    std_path = pjoin(data_root, 'Std.npy')
+    # Mean/Std: 优先 mean_std_dir（semi_synthetic 时可指向 BEAT 等），否则用 dataset_dir
+    mean_std_root = getattr(args, 'mean_std_dir', None) or data_root
+    mean_path = pjoin(mean_std_root, 'Mean.npy')
+    std_path = pjoin(mean_std_root, 'Std.npy')
     if not os.path.exists(mean_path) or not os.path.exists(std_path):
-        raise FileNotFoundError(f"Mean.npy or Std.npy not found in {data_root}. Please run VAE training first.")
+        raise FileNotFoundError(f"Mean.npy or Std.npy not found in {mean_std_root}. Copy from BEAT/mixed or run VAE first.")
     mean = np.load(mean_path)
     std = np.load(std_path)
 
-    if use_segment:
+    if use_semi_synthetic:
+        segment_dir = data_root
+        train_split = pjoin(segment_dir, 'train.txt')
+        val_split = pjoin(segment_dir, 'val.txt')
+        if not os.path.exists(train_split) or not os.path.exists(val_split):
+            raise FileNotFoundError(f"train.txt/val.txt not found in {segment_dir}. Run scripts/split_semi_synthetic.py first.")
+        clip_dir = getattr(args, 'clip_segments_dir', None)
+        train_dataset = SemiSyntheticSegmentDataset(segment_dir, train_split, mean, std, max_motion_length, clip_dir=clip_dir, evaluation=False)
+        val_dataset = SemiSyntheticSegmentDataset(segment_dir, val_split, mean, std, max_motion_length, clip_dir=clip_dir, evaluation=False)
+    elif use_segment:
         segment_dir = pjoin(data_root, 'segment')
         train_split = pjoin(segment_dir, 'segment_train.txt')
         val_split = pjoin(segment_dir, 'segment_test.txt')
@@ -71,7 +83,10 @@ def main(args):
     eval_loader = None
     if args.need_evaluation:
         eval_mean, eval_std = mean, std
-        if use_segment:
+        if use_semi_synthetic:
+            split_file = pjoin(segment_dir, 'val.txt')
+            eval_dataset = SemiSyntheticSegmentDataset(segment_dir, split_file, eval_mean, eval_std, max_motion_length, clip_dir=getattr(args, 'clip_segments_dir', None), evaluation=True)
+        elif use_segment:
             split_file = pjoin(segment_dir, 'segment_test.txt')
             eval_dataset = BeatSegmentDataset(segment_dir, split_file, eval_mean, eval_std, max_motion_length, 20, evaluation=True)
         else:
@@ -104,15 +119,24 @@ def main(args):
     ae.load_state_dict(ckpt[model_key])
     print(f"Loaded VAE from {ae_checkpoint_path}")
 
-    # Create MARDM model（use_segment 时用 whisper 条件，否则 text）
-    cond_mode = getattr(args, 'cond_mode', None) or ('whisper' if use_segment else 'text')
+    # Create MARDM model（use_semi_synthetic 用 clip 预计算特征，use_segment 用 whisper，否则 text）
+    cond_mode = getattr(args, 'cond_mode', None) or ('clip' if use_semi_synthetic else ('whisper' if use_segment else 'text'))
     whisper_dim = None
-    if cond_mode == 'whisper':
+    clip_dim = 512
+    if cond_mode == 'clip':
+        sample_clip = train_dataset[0][0]
+        clip_dim = int(sample_clip.shape[-1]) if hasattr(sample_clip, 'shape') else int(len(sample_clip))
+        print(f'CLIP condition dim (from data): {clip_dim}')
+    elif cond_mode == 'whisper':
         # 从数据推断 whisper 特征维度（segment 可能为 512 或 1024）
         sample_whisper = train_dataset[0][0]
         whisper_dim = sample_whisper.shape[-1]
         print(f'Whisper condition dim (from data): {whisper_dim}')
-    mardm = MARDM_models[args.model](ae_dim=ae.output_emb_width, cond_mode=cond_mode, whisper_dim=whisper_dim or 512)
+    mardm = MARDM_models[args.model](
+        ae_dim=ae.output_emb_width, cond_mode=cond_mode, whisper_dim=whisper_dim or 512,
+        clip_dim=clip_dim,
+        use_prefix_condition=getattr(args, 'use_prefix_condition', False)
+    )
     ema_mardm = copy.deepcopy(mardm)
     ema_mardm.eval()
     for param in ema_mardm.parameters():
@@ -175,8 +199,12 @@ def main(args):
     worst_loss = 100
 
     # VAE downsampling factor: down_t=4 means 2^4=16x downsampling
-    # Note: Original VAE had down_t=2 (4x), but we changed to down_t=4 (16x)
     vae_downsample_factor = 16
+    # 前 64 帧 + 音频 -> 预测后 224 帧（总 288 帧）
+    use_prefix_condition = getattr(args, 'use_prefix_condition', False)
+    prefix_frames, suffix_frames = 64, 224
+    total_prefix_suffix_frames = prefix_frames + suffix_frames  # 288
+    suffix_latent_len = suffix_frames // vae_downsample_factor  # 14
 
     while epoch < args.epoch:
         ae.eval()
@@ -191,13 +219,21 @@ def main(args):
             motion = motion.detach().float().to(device)
             m_lens = m_lens.detach().long().to(device)
 
-            latent = ae.encode(motion)
-            # VAE downsampling: divide by 16 (was 4 for original VAE)
-            m_lens = m_lens // vae_downsample_factor
-
-            conds = conds.to(device).float() if torch.is_tensor(conds) else conds
-
-            loss = mardm.forward_loss(latent, conds, m_lens)
+            if use_prefix_condition:
+                # 只用前 288 帧：前 64 帧作条件，预测后 224 帧
+                motion = motion[:, :total_prefix_suffix_frames]
+                prefix_motion = motion[:, :prefix_frames]
+                suffix_motion = motion[:, prefix_frames:total_prefix_suffix_frames]
+                prefix_latent = ae.encode(prefix_motion)
+                suffix_latent = ae.encode(suffix_motion)
+                m_lens_suffix = torch.full((motion.shape[0],), suffix_latent_len, device=motion.device, dtype=torch.long)
+                conds = (conds.to(device).float() if torch.is_tensor(conds) else conds, prefix_latent)
+                loss = mardm.forward_loss(suffix_latent, conds, m_lens_suffix)
+            else:
+                latent = ae.encode(motion)
+                m_lens = m_lens // vae_downsample_factor
+                conds = conds.to(device).float() if torch.is_tensor(conds) else conds
+                loss = mardm.forward_loss(latent, conds, m_lens)
 
             optimizer.zero_grad()
             loss.backward()
@@ -240,12 +276,20 @@ def main(args):
                 motion = motion.detach().float().to(device)
                 m_lens = m_lens.detach().long().to(device)
 
-                latent = ae.encode(motion)
-                m_lens = m_lens // vae_downsample_factor
-
-                conds = conds.to(device).float() if torch.is_tensor(conds) else conds
-
-                loss = mardm.forward_loss(latent, conds, m_lens)
+                if use_prefix_condition:
+                    motion = motion[:, :total_prefix_suffix_frames]
+                    prefix_motion = motion[:, :prefix_frames]
+                    suffix_motion = motion[:, prefix_frames:total_prefix_suffix_frames]
+                    prefix_latent = ae.encode(prefix_motion)
+                    suffix_latent = ae.encode(suffix_motion)
+                    m_lens_suffix = torch.full((motion.shape[0],), suffix_latent_len, device=motion.device, dtype=torch.long)
+                    conds_val = (conds.to(device).float() if torch.is_tensor(conds) else conds, prefix_latent)
+                    loss = mardm.forward_loss(suffix_latent, conds_val, m_lens_suffix)
+                else:
+                    latent = ae.encode(motion)
+                    m_lens = m_lens // vae_downsample_factor
+                    conds = conds.to(device).float() if torch.is_tensor(conds) else conds
+                    loss = mardm.forward_loss(latent, conds, m_lens)
                 val_loss.append(loss.item())
 
         print(f"Validation loss:{np.mean(val_loss):.3f}")
@@ -274,8 +318,16 @@ if __name__ == "__main__":
                         help='AE 模型目录（含 checkpoint 文件）；BEAT mixed 可用 ./checkpoints/mixed/ae/model')
     parser.add_argument('--use_segment', action='store_true',
                         help='使用 BEAT segment（dataset_dir/segment/segment_train.npz 等）')
-    parser.add_argument('--cond_mode', type=str, default=None, choices=['text', 'whisper'],
-                        help='条件类型：text=CLIP 文本；whisper=Whisper 音频特征。use_segment 时默认 whisper')
+    parser.add_argument('--use_semi_synthetic', action='store_true',
+                        help='使用 semi_synthetic 段数据：dataset_dir 下 *_motion.npz + *_clip_description.npy，需 train.txt/val.txt')
+    parser.add_argument('--clip_segments_dir', type=str, default=None,
+                        help='semi_synthetic 时 CLIP 特征目录（默认与 dataset_dir 相同；可设为 v1 路径以用 v1 的 clip_description）')
+    parser.add_argument('--mean_std_dir', type=str, default=None,
+                        help='Mean.npy/Std.npy 所在目录（semi_synthetic 时可指向 BEAT 等已有 VAE 数据）')
+    parser.add_argument('--cond_mode', type=str, default=None, choices=['text', 'whisper', 'clip'],
+                        help='条件类型：text=CLIP 文本；whisper=Whisper 音频；clip=预计算 CLIP 特征。use_semi_synthetic 时默认 clip')
+    parser.add_argument('--use_prefix_condition', action='store_true',
+                        help='前64帧+音频预测后224帧（共288帧）；需与 use_segment 同用')
     parser.add_argument('--model', type=str, default='MARDM-SiT-XL')
     parser.add_argument('--dataset_dir', type=str, default='./data/G1ML3D_v1',
                         help='Root directory of G1ML3D dataset')
